@@ -57,3 +57,8 @@ class PrintAttrs(Attrs):
 @tvm._ffi.register_object("relax.attrs.AssertOpAttrs")
 class AssertOpAttrs(Attrs):
     """Attributes used for the assert operator"""
+
+
+@tvm._ffi.register_object("relax.attrs.Conv2DAttrs")
+class Conv2DAttrs(Attrs):
+    """Attributes for nn.Conv2D"""
