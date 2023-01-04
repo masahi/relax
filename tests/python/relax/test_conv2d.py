@@ -32,8 +32,9 @@ from tvm.ir.module import IRModule
 class Conv2d:
     # T.func_attr({"global_symbol": "main", "tir.noalias": True})
     @R.function
-    def conv2d(data: R.Tensor((1, 64, 56, 56), "float32"),
-               weight: R.Tensor((64, 64, 3, 3), "float32")):
+    def conv2d(
+        data: R.Tensor((1, 64, 56, 56), "float32"), weight: R.Tensor((64, 64, 3, 3), "float32")
+    ):
         return relax.nn.conv2d(data, weight, padding=(1, 1), kernel_size=(3, 3))
 
 
@@ -47,15 +48,17 @@ class OperatorLegalizer(PyExprMutator):
         if call.op == tvm.ir.Op.get("relax.nn.conv2d"):
             args = call.args
             attrs = call.attrs
-            return self.builder_.call_te(topi.nn.conv2d,
-                                         input=args[0],
-                                         filter=args[1],
-                                         strides=attrs.strides,
-                                         padding=attrs.padding,
-                                         dilation=attrs.dilation,
-                                         data_layout=attrs.data_layout,
-                                         kernel_layout=attrs.kernel_layout,
-                                         out_dtype=attrs.out_dtype if attrs.out_dtype != "" else None)
+            return self.builder_.call_te(
+                topi.nn.conv2d,
+                input=args[0],
+                filter=args[1],
+                strides=attrs.strides,
+                padding=attrs.padding,
+                dilation=attrs.dilation,
+                data_layout=attrs.data_layout,
+                kernel_layout=attrs.kernel_layout,
+                out_dtype=attrs.out_dtype if attrs.out_dtype != "" else None,
+            )
 
         return call
 
