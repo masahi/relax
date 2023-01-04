@@ -149,7 +149,27 @@ with the layer input to produce a tensor of outputs.
     .set_attrs_type<Conv2DAttrs>()
     .set_attr<FInferStructInfo>("FInferStructInfo", InferStructInfoConv2d);
 
-  // RELAY_REGISTER_UNARY_OP("nn.relu");
+
+StructInfo InferStructInfoUnary(const Call& call, const BlockBuilder& ctx) {
+  if (call->args.size() != 1) {
+    ctx->ReportFatal(Diagnostic::Error(call) << "Unary op should have 1 argument");
+  }
+  auto* sinfo = GetStructInfoAs<TensorStructInfoNode>(call->args[0]);
+  return TensorStructInfo(sinfo->shape.value(), sinfo->dtype);
+}
+
+TVM_REGISTER_GLOBAL("relax.op.nn.relu").set_body_typed([](Expr inp) {
+  const Op& op = Op::Get("relax.nn.relu");
+  return Call(op, {inp});
+});
+
+RELAY_REGISTER_OP("relax.nn.relu")
+    .describe(
+        "This operation returns the unique elements and the new index of each item in a given "
+        "tensor.")
+    .set_num_inputs(1)
+    .add_argument("data", "Tensor", "The input tensor")
+    .set_attr<FInferStructInfo>("FInferStructInfo", InferStructInfoUnary);
 
 }  // namespace relax
 }  // namespace tvm

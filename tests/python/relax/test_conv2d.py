@@ -29,13 +29,13 @@ from tvm.ir.module import IRModule
 
 
 @tvm.script.ir_module
-class Conv2d:
+class Conv2dReLU:
     # T.func_attr({"global_symbol": "main", "tir.noalias": True})
     @R.function
     def conv2d(
         data: R.Tensor((1, 64, 56, 56), "float32"), weight: R.Tensor((64, 64, 3, 3), "float32")
     ):
-        return relax.nn.conv2d(data, weight, padding=(1, 1), kernel_size=(3, 3))
+        return relax.nn.relu(relax.nn.conv2d(data, weight, padding=(1, 1), kernel_size=(3, 3)))
 
 
 @mutator
@@ -59,6 +59,8 @@ class OperatorLegalizer(PyExprMutator):
                 kernel_layout=attrs.kernel_layout,
                 out_dtype=attrs.out_dtype if attrs.out_dtype != "" else None,
             )
+        if call.op == tvm.ir.Op.get("relax.nn.relu"):
+            return self.builder_.call_te(topi.nn.relu, call.args[0])
 
         return call
 
@@ -77,7 +79,7 @@ class OperatorLegalizer(PyExprMutator):
 
 
 def test_conv2d():
-    mod = OperatorLegalizer(Conv2d).transform()
+    mod = OperatorLegalizer(Conv2dReLU).transform()
     target = tvm.target.Target("llvm")
     ex = relax.vm.build(mod, target)
     vm = relax.VirtualMachine(ex, tvm.cpu())
