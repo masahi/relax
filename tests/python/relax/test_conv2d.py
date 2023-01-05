@@ -15,17 +15,17 @@
 # specific language governing permissions and limitations
 # under the License.
 
-import sys
-import tempfile
-
 import numpy as np
 import tvm
 import tvm.testing
+
+from tvm.relax.struct_info import TensorStructInfo
+from tvm.relay.op.contrib.dnnl import make_dnnl_pattern
 from tvm import relax, topi
-from tvm._ffi.base import TVMError
 from tvm.script import relax as R
-from tvm.relax.expr_functor import mutator, PyExprMutator
+from tvm.relax.expr_functor import mutator, PyExprMutator, visitor, PyExprVisitor
 from tvm.ir.module import IRModule
+from tvm.relax.dpl import *
 
 
 @tvm.script.ir_module
@@ -78,7 +78,7 @@ class OperatorLegalizer(PyExprMutator):
         return self._convert_op(call)
 
 
-def test_conv2d():
+def test_conv2d_run():
     mod = OperatorLegalizer(Conv2dReLU).transform()
     target = tvm.target.Target("llvm")
     ex = relax.vm.build(mod, target)
@@ -90,5 +90,34 @@ def test_conv2d():
     print(out.numpy())
 
 
+@visitor
+class MatchConv2d(PyExprVisitor):
+    def __init__(self) -> None:
+        super().__init__()
+        # x = relax.Var("x", TensorStructInfo((1, 64, 56, 56), "float32"))
+        # y = relax.Var("y", TensorStructInfo((64, 64, 3, 3), "float32"))
+        xp = is_var("data")
+        yp = is_var("weight")
+
+        self.pat = is_op("relax.nn.conv2d")(xp, yp)
+
+    def visit_call_(self, call):
+        for arg in call.args:
+            self.visit_expr(arg)
+        self.visit_expr(call.op)
+
+        if call.op == tvm.ir.Op.get("relax.nn.conv2d"):
+            print(self.pat.match(call))
+
+
+def test_conv2d_match():
+    mod = Conv2dReLU
+    matcher = MatchConv2d()
+
+    for global_var, func in mod.functions.items():
+        if isinstance(func, relax.Function):
+            matcher.visit_expr(func)
+
+
 if __name__ == "__main__":
-    test_conv2d()
+    test_conv2d_match()
