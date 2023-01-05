@@ -19,8 +19,7 @@ import numpy as np
 import tvm
 import tvm.testing
 
-from tvm.relax.struct_info import TensorStructInfo
-from tvm.relay.op.contrib.dnnl import make_dnnl_pattern
+from tvm.relax.analysis import get_var2val
 from tvm import relax, topi
 from tvm.script import relax as R
 from tvm.relax.expr_functor import mutator, PyExprMutator, visitor, PyExprVisitor
@@ -90,31 +89,63 @@ def test_conv2d_run():
     print(out.numpy())
 
 
+def append_eltwise_ops(op, eltwise):
+    if eltwise == "gelu":
+        const1 = wildcard()
+        const2 = wildcard()
+        const3 = wildcard()
+        div = is_op("divide")(op, const1)
+        erf_val = is_op("erf")(div)
+        added_erf_val = is_op("add")(erf_val, const2)
+        mul_val = is_op("multiply")(op, added_erf_val)
+        op = is_op("multiply")(mul_val, const3)
+    elif eltwise == "swish":
+        sig_out = is_op("sigmoid")(op)
+        op = is_op("multiply")(op, sig_out)
+    elif eltwise == "mish":
+        const1 = wildcard()
+        exp = is_op("exp")(op)
+        add = is_op("add")(exp, const1)
+        log = is_op("log")(add)
+        tanh = is_op("tanh")(log)
+        op = is_op("multiply")(op, tanh)
+    elif eltwise:
+        op = is_op(eltwise)(op)
+    return op
+
+
+def make_conv_pattern(conv_name, with_bias=True, with_eltwise=None):
+    data = wildcard()
+    weight = wildcard()
+    bias = wildcard()
+    conv = is_op(conv_name)(data, weight)
+    if with_bias:
+        conv_out = is_op("add")(conv, bias)
+    else:
+        conv_out = conv
+    return append_eltwise_ops(conv_out, with_eltwise)
+
+
 @visitor
 class MatchConv2d(PyExprVisitor):
-    def __init__(self) -> None:
+    def __init__(self, binding) -> None:
         super().__init__()
-        # x = relax.Var("x", TensorStructInfo((1, 64, 56, 56), "float32"))
-        # y = relax.Var("y", TensorStructInfo((64, 64, 3, 3), "float32"))
-        xp = is_var("data")
-        yp = is_var("weight")
-
-        self.pat = is_op("relax.nn.conv2d")(xp, yp)
+        self.pat = make_conv_pattern("relax.nn.conv2d", False, "relax.nn.relu")
+        self.binding = binding
 
     def visit_call_(self, call):
         for arg in call.args:
             self.visit_expr(arg)
         self.visit_expr(call.op)
 
-        if call.op == tvm.ir.Op.get("relax.nn.conv2d"):
-            print(self.pat.match(call))
+        print(self.pat.match(call, self.binding))
 
 
 def test_conv2d_match():
     mod = Conv2dReLU
-    matcher = MatchConv2d()
+    matcher = MatchConv2d(get_var2val(mod["conv2d"]))
 
-    for global_var, func in mod.functions.items():
+    for func in mod.functions.values():
         if isinstance(func, relax.Function):
             matcher.visit_expr(func)
 
