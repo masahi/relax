@@ -59,8 +59,7 @@ Expr MakeConv2D(Expr data, Expr weight, Array<PrimExpr> strides, Array<PrimExpr>
                                "relax.nn.conv2d");
 }
 
-  StructInfo InferStructInfoConv2d(const Call& call, const BlockBuilder& ctx) {
-
+StructInfo InferStructInfoConv2d(const Call& call, const BlockBuilder& ctx) {
   if (call->args.size() != 2) {
     ctx->ReportFatal(Diagnostic::Error(call->span) << "Conv2d op should have 2 arguments");
   }
@@ -105,8 +104,7 @@ Expr MakeConv2D(Expr data, Expr weight, Array<PrimExpr> strides, Array<PrimExpr>
     if (ndim0 != 4 || ndim1 != 4) {
       LOG(INFO) << ndim0;
       LOG(INFO) << ndim1;
-      ctx->ReportFatal(Diagnostic::Error(call)
-		       << "The 2 arguments of Conv2d must be 4D Tensors");
+      ctx->ReportFatal(Diagnostic::Error(call) << "The 2 arguments of Conv2d must be 4D Tensors");
     }
     // N
     output_shape.push_back(data_shape->values[0]);
@@ -149,15 +147,6 @@ with the layer input to produce a tensor of outputs.
     .set_attrs_type<Conv2DAttrs>()
     .set_attr<FInferStructInfo>("FInferStructInfo", InferStructInfoConv2d);
 
-
-StructInfo InferStructInfoUnary(const Call& call, const BlockBuilder& ctx) {
-  if (call->args.size() != 1) {
-    ctx->ReportFatal(Diagnostic::Error(call) << "Unary op should have 1 argument");
-  }
-  auto* sinfo = GetStructInfoAs<TensorStructInfoNode>(call->args[0]);
-  return TensorStructInfo(sinfo->shape.value(), sinfo->dtype);
-}
-
 TVM_REGISTER_GLOBAL("relax.op.nn.relu").set_body_typed([](Expr inp) {
   const Op& op = Op::Get("relax.nn.relu");
   return Call(op, {inp});
@@ -169,7 +158,7 @@ RELAY_REGISTER_OP("relax.nn.relu")
         "tensor.")
     .set_num_inputs(1)
     .add_argument("data", "Tensor", "The input tensor")
-    .set_attr<FInferStructInfo>("FInferStructInfo", InferStructInfoUnary);
+    .set_attr<FInferStructInfo>("FInferStructInfo", InferStructInfoUnary<false>);
 
 }  // namespace relax
 }  // namespace tvm
