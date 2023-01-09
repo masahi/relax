@@ -198,7 +198,7 @@ class DFPattern(Node):
         Unlike Relay whose function is an expression, functions in Relax consists
         of blocks of bindings that they are not syntactically connected. We use a
         mapping (i.e., var2val) to migrate the gap. For example, to when matching
-        "relax.add(lv0, lv1)", given var2val, we match lv0's binded expression
+        "relax.add(lv0, lv1)", given var2val, we match lv0's bound expression
         when the recursive pattern matching goes to check lv0. The var2val mapping
         can be computed through the tvm.relax.analysis.get_var2val function.
         """
