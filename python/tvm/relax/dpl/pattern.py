@@ -1056,3 +1056,7 @@ def _only_used_by(
     if isinstance(rhs, DFPattern):
         rhs = PatternSeq([rhs])
     return ffi.only_used_by(lhs, rhs, index)  # type: ignore
+
+
+def partition(pattern, expr):
+    return ffi.partition(pattern, expr)  # type: ignore

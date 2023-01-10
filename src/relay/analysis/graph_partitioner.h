@@ -21,6 +21,8 @@
  * \file src/relay/analysis/graph_partitioner.h
  * \brief The helper function for op fusion.
  */
+#ifndef TVM_RELAY_ANALYSIS_GRAPH_PARTITIONER_H_
+#define TVM_RELAY_ANALYSIS_GRAPH_PARTITIONER_H_
 
 #include <tvm/relay/op_attr_types.h>
 
@@ -256,3 +258,5 @@ class GraphPartitioner {
 
 }  // namespace relay
 }  // namespace tvm
+
+#endif  // TVM_RELAY_ANALYSIS_GRAPH_PARTITIONER_H_

@@ -372,15 +372,22 @@ class FunctionCreator : public ExprMutator {
 
     if (const auto* var_binding = binding.as<VarBindingNode>()) {
       if (const auto* call = var_binding->value.as<CallNode>()) {
-        ICHECK(call->op == Op::Get("relax.call_tir"));
-        // Update the name of the function.
-        name_hint_ = name_hint_ + "_" + Downcast<GlobalVar>(call->args[0])->name_hint;
+        if (call->op == Op::Get("relax.call_tir")) {
+          // Update the name of the function.
+          name_hint_ = name_hint_ + "_" + Downcast<GlobalVar>(call->args[0])->name_hint;
 
-        const Tuple& args = Downcast<Tuple>(call->args[1]);
-        for (const Expr& arg : args->fields) {
-          CheckDefAndUpdateParam(arg);
+          const Tuple& args = Downcast<Tuple>(call->args[1]);
+          for (const Expr& arg : args->fields) {
+            CheckDefAndUpdateParam(arg);
+          }
+          // TODO(tvm-team): handle shape expr
+        } else {
+          // Update the name of the function.
+          name_hint_ = name_hint_ + "_" + Downcast<Var>(call->args[0])->name_hint();
+          for (const Expr& arg : call->args) {
+            CheckDefAndUpdateParam(arg);
+          }
         }
-        // TODO(tvm-team): handle shape expr
       } else {
         const auto* tuple_item = var_binding->value.as<TupleGetItemNode>();
         ICHECK(tuple_item != nullptr);
@@ -407,7 +414,7 @@ class FunctionCreator : public ExprMutator {
 
   /*!
    * \brief Create the grouped function according according to the collected bindings and parameters
-   * \note The created function won't be returned immediately. Tt's stored in the `function_` field.
+   * \note The created function won't be returned immediately. It's stored in the `function_` field.
    */
   void CreateFunction() {
     // Step 1. Start constructing a new dataflow block.
@@ -543,14 +550,16 @@ class OperatorFusor : public ExprMutator {
     }
   }
 
+  OperatorFusor(IRModule mod,
+                const std::unordered_map<const Object*, GraphPartitioner::Group*>& obj2group)
+      : ExprMutator(mod), mod_(std::move(mod)), obj2group_(obj2group) {}
+
   /*!
    * \brief The main transformation on the IRModule
    * \return The new IRModule after transformation
    */
   IRModule Transform() {
-    for (const auto& kv : mod_->functions) {
-      const GlobalVar& gv = kv.first;
-      const BaseFunc& func = kv.second;
+    for (const auto& [gv, func] : mod_->functions) {
       // Only visit Relax function without attr kPrimitive.
       if (func->IsInstance<relax::FunctionNode>() && !func->HasNonzeroAttr(attr::kPrimitive)) {
         auto updated_func = Downcast<Function>(VisitExpr(func));
@@ -579,8 +588,7 @@ class OperatorFusor : public ExprMutator {
     CollectFuncBoundary(block->bindings);
 
     // Step 3. Create the grouped function for each group.
-    for (auto& kv : group2func_) {
-      FunctionCreator& creator = kv.second;
+    for (auto& [_, creator] : group2func_) {
       creator.CreateFunction();
     }
 
@@ -755,6 +763,10 @@ IRModule FuseOps(IRModule mod, int opt_level, size_t max_fuse_depth) {
   mod = OperatorFusor(mod, graph, groups).Transform();
 
   return mod;
+}
+
+IRModule GroupOps(IRModule mod, const std::unordered_map<const Object*, GraphPartitioner::Group*>& group_map){
+  return OperatorFusor(mod, group_map).Transform();
 }
 
 namespace transform {

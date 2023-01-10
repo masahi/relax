@@ -78,7 +78,7 @@ class OperatorLegalizer(PyExprMutator):
 
 
 def test_conv2d_run():
-    mod = OperatorLegalizer(Conv2dReLU).transform()
+    mod = OperatorLegalizer(Conv2dReLUx2).transform()
     target = tvm.target.Target("llvm")
     ex = relax.vm.build(mod, target)
     vm = relax.VirtualMachine(ex, tvm.cpu())
@@ -150,6 +150,49 @@ def test_conv2d_match():
             matcher.visit_expr(func)
 
 
+@tvm.script.ir_module
+class Conv2dReLUx2:
+    @R.function
+    def conv2d(
+        data: R.Tensor((1, 64, 56, 56), "float32"),
+        weight1: R.Tensor((64, 64, 3, 3), "float32"),
+        weight2: R.Tensor((64, 64, 3, 3), "float32"),
+    ):
+        with R.dataflow():
+            conv1 = relax.op.nn.relu(relax.op.nn.conv2d(data, weight1, padding=(1, 1)))
+            conv2d = relax.op.nn.relu(relax.op.nn.conv2d(conv1, weight2, padding=(0, 0)))
+            R.output(conv2d)
+
+        return conv2d
+
+
+def test_conv2d_partition():
+    mod = Conv2dReLUx2
+    print(mod.script())
+
+    pat = make_conv_pattern("relax.nn.conv2d", False, "relax.nn.relu")
+    mod = partition(pat, mod)
+
+    print(mod.script())
+    # lifted = relax.transform.LambdaLift()(mod)
+    # print(lifted.script())
+
+    # mod = OperatorLegalizer(lifted).transform()
+
+    # # print(mod.script())
+
+    # target = tvm.target.Target("llvm")
+    # ex = relax.vm.build(mod, target)
+    # vm = relax.VirtualMachine(ex, tvm.cpu())
+    # f = vm["conv2d"]
+    # data_np = np.random.randn(1, 64, 56, 56).astype("float32")
+    # weight1_np = np.random.randn(64, 64, 3, 3).astype("float32")
+    # weight2_np = np.random.randn(64, 64, 3, 3).astype("float32")
+    # out = f(tvm.nd.array(data_np), tvm.nd.array(weight1_np), tvm.nd.array(weight2_np))
+    # print(out.numpy())
+
+
+
 if __name__ == "__main__":
-    # test_conv2d_match()
-    test_conv2d_run()
+    test_conv2d_partition()
+    # test_conv2d_run()
