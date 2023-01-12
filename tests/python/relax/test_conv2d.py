@@ -19,22 +19,11 @@ import numpy as np
 import tvm
 import tvm.testing
 
-from tvm.relax.analysis import get_var2val
-from tvm import relax, topi
+from tvm import relax, topi, relay
 from tvm.script import relax as R
-from tvm.relax.expr_functor import mutator, PyExprMutator, visitor, PyExprVisitor
+from tvm.relax.expr_functor import mutator, PyExprMutator
 from tvm.ir.module import IRModule
 from tvm.relax.dpl import *
-
-
-@tvm.script.ir_module
-class Conv2dReLU:
-    # T.func_attr({"global_symbol": "main", "tir.noalias": True})
-    @R.function
-    def conv2d(
-        data: R.Tensor((1, 64, 56, 56), "float32"), weight: R.Tensor((64, 64, 3, 3), "float32")
-    ):
-        return relax.op.nn.relu(relax.op.nn.conv2d(data, weight, padding=(1, 1)))
 
 
 @mutator
@@ -77,77 +66,18 @@ class OperatorLegalizer(PyExprMutator):
         return self._convert_op(call)
 
 
-def test_conv2d_run():
-    mod = OperatorLegalizer(Conv2dReLUx2).transform()
-    target = tvm.target.Target("llvm")
-    ex = relax.vm.build(mod, target)
-    vm = relax.VirtualMachine(ex, tvm.cpu())
-    f = vm["conv2d"]
-    data_np = np.random.randn(1, 64, 56, 56).astype("float32")
-    weight_np = np.random.randn(64, 64, 3, 3).astype("float32")
-    out = f(tvm.nd.array(data_np), tvm.nd.array(weight_np))
-    print(out.numpy())
-
-
-def append_eltwise_ops(op, eltwise):
-    if eltwise == "gelu":
-        const1 = wildcard()
-        const2 = wildcard()
-        const3 = wildcard()
-        div = is_op("divide")(op, const1)
-        erf_val = is_op("erf")(div)
-        added_erf_val = is_op("add")(erf_val, const2)
-        mul_val = is_op("multiply")(op, added_erf_val)
-        op = is_op("multiply")(mul_val, const3)
-    elif eltwise == "swish":
-        sig_out = is_op("sigmoid")(op)
-        op = is_op("multiply")(op, sig_out)
-    elif eltwise == "mish":
-        const1 = wildcard()
-        exp = is_op("exp")(op)
-        add = is_op("add")(exp, const1)
-        log = is_op("log")(add)
-        tanh = is_op("tanh")(log)
-        op = is_op("multiply")(op, tanh)
-    elif eltwise:
-        op = is_op(eltwise)(op)
-    return op
-
-
-def make_conv_pattern(conv_name, with_bias=True, with_eltwise=None):
+def make_conv_pattern(conv_name, with_bias=False, activation=None):
     data = wildcard()
     weight = wildcard()
-    bias = wildcard()
     conv = is_op(conv_name)(data, weight)
+
     if with_bias:
+        bias = wildcard()
         conv_out = is_op("add")(conv, bias)
     else:
         conv_out = conv
-    return append_eltwise_ops(conv_out, with_eltwise)
 
-
-@visitor
-class MatchConv2d(PyExprVisitor):
-    def __init__(self, binding) -> None:
-        super().__init__()
-        self.pat = make_conv_pattern("relax.nn.conv2d", False, "relax.nn.relu")
-        self.binding = binding
-
-    def visit_call_(self, call):
-        for arg in call.args:
-            self.visit_expr(arg)
-        self.visit_expr(call.op)
-
-        print(self.pat.match(call, self.binding))
-
-
-def test_conv2d_match():
-    mod = Conv2dReLU
-    matcher = MatchConv2d(get_var2val(mod["conv2d"]))
-
-    for func in mod.functions.values():
-        if isinstance(func, relax.Function):
-            matcher.visit_expr(func)
+    return is_op(activation)(conv_out)
 
 
 @tvm.script.ir_module
@@ -166,33 +96,57 @@ class Conv2dReLUx2:
         return conv2d
 
 
+def get_relay_conv2d_relu_x2(d_shape, w_shape):
+    data = relay.var("data", shape=d_shape)
+    weight1 = relay.var("weight1", shape=w_shape)
+    weight2 = relay.var("weight2", shape=w_shape)
+    conv1 = relay.nn.relu(
+        relay.nn.conv2d(
+            data=data,
+            weight=weight1,
+            kernel_size=w_shape[2:],
+            padding=(1, 1),
+        )
+    )
+    return relay.nn.relu(
+        relay.nn.conv2d(
+            data=conv1,
+            weight=weight2,
+            kernel_size=w_shape[2:],
+            padding=(0, 0),
+        )
+    )
+
+
 def test_conv2d_partition():
     mod = Conv2dReLUx2
-    print(mod.script())
-
     pat = make_conv_pattern("relax.nn.conv2d", False, "relax.nn.relu")
-    mod = partition(pat, mod)
+    mod = relax.transform.FuseOpsByPattern(pat)(mod)
 
     print(mod.script())
-    # lifted = relax.transform.LambdaLift()(mod)
-    # print(lifted.script())
 
-    # mod = OperatorLegalizer(lifted).transform()
+    mod = OperatorLegalizer(mod).transform()
 
-    # # print(mod.script())
+    target = tvm.target.Target("llvm")
+    ex = relax.vm.build(mod, target)
+    vm = relax.VirtualMachine(ex, tvm.cpu())
+    f = vm["conv2d"]
 
-    # target = tvm.target.Target("llvm")
-    # ex = relax.vm.build(mod, target)
-    # vm = relax.VirtualMachine(ex, tvm.cpu())
-    # f = vm["conv2d"]
-    # data_np = np.random.randn(1, 64, 56, 56).astype("float32")
-    # weight1_np = np.random.randn(64, 64, 3, 3).astype("float32")
-    # weight2_np = np.random.randn(64, 64, 3, 3).astype("float32")
-    # out = f(tvm.nd.array(data_np), tvm.nd.array(weight1_np), tvm.nd.array(weight2_np))
-    # print(out.numpy())
+    data_np = np.random.randn(1, 64, 56, 56).astype("float32")
+    weight1_np = np.random.randn(64, 64, 3, 3).astype("float32")
+    weight2_np = np.random.randn(64, 64, 3, 3).astype("float32")
+    out = f(tvm.nd.array(data_np), tvm.nd.array(weight1_np), tvm.nd.array(weight2_np)).numpy()
 
+    relay_mod = tvm.IRModule.from_expr(get_relay_conv2d_relu_x2(data_np.shape, weight1_np.shape))
+
+    ref = (
+        relay.create_executor("graph", mod=relay_mod, device=tvm.cpu(0), target="llvm")
+        .evaluate()(*[data_np, weight1_np, weight2_np])
+        .numpy()
+    )
+
+    print(np.max(np.abs(out - ref)), np.mean(np.abs(out - ref)))
 
 
 if __name__ == "__main__":
     test_conv2d_partition()
-    # test_conv2d_run()

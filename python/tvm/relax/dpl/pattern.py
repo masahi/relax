@@ -25,10 +25,10 @@ import typing
 import tvm
 import tvm._ffi as tvm_ffi
 from tvm.ir.expr import PrimExpr
-from tvm.relax import Expr, Var
 from tvm.relay.op import get
 from tvm.ir.container import Array
 
+from ..expr import Expr, Var
 from ...ir import make_node
 from ...runtime import Object
 from ...ir.base import Node
@@ -1056,7 +1056,3 @@ def _only_used_by(
     if isinstance(rhs, DFPattern):
         rhs = PatternSeq([rhs])
     return ffi.only_used_by(lhs, rhs, index)  # type: ignore
-
-
-def partition(pattern, expr):
-    return ffi.partition(pattern, expr)  # type: ignore

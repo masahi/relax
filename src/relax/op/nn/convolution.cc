@@ -62,7 +62,6 @@ StructInfo InferStructInfoConv2d(const Call& call, const BlockBuilder& ctx) {
   TensorStructInfo weight_sinfo = input_sinfo[1];
 
   const auto* attrs = call->attrs.as<Conv2DAttrs>();
-  ICHECK(attrs);
   auto [data_layout, data2NCHW] = CheckTensorLayout(call, ctx, attrs->data_layout,  //
                                                     /*tgt_layout=*/"NCHW",          //
                                                     /*tensor_name=*/"data");

@@ -27,6 +27,9 @@
  * A follow-up pass named "FuseTIR" will generate a TIR PrimFunc for each grouped function.
  */
 
+#include <tvm/relax/analysis.h>
+#include <tvm/relax/dataflow_matcher.h>
+#include <tvm/relax/dataflow_pattern.h>
 #include <tvm/relax/expr_functor.h>
 #include <tvm/relax/struct_info.h>
 #include <tvm/relax/transform.h>
@@ -382,8 +385,8 @@ class FunctionCreator : public ExprMutator {
           }
           // TODO(tvm-team): handle shape expr
         } else {
-          // Update the name of the function.
-          name_hint_ = name_hint_ + "_" + Downcast<Var>(call->args[0])->name_hint();
+          ICHECK(call->op->IsInstance<OpNode>());
+          name_hint_ = name_hint_ + "_" + Downcast<Op>(call->op)->name;
           for (const Expr& arg : call->args) {
             CheckDefAndUpdateParam(arg);
           }
@@ -765,7 +768,87 @@ IRModule FuseOps(IRModule mod, int opt_level, size_t max_fuse_depth) {
   return mod;
 }
 
-IRModule GroupOps(IRModule mod, const std::unordered_map<const Object*, GraphPartitioner::Group*>& group_map){
+static Map<Expr, Var> GetBindingInverse(const Map<Var, Expr>& binding) {
+  Map<Expr, Var> value_to_bound_var;
+  for (const auto& [var, val] : binding) {
+    value_to_bound_var.Set(val, var);
+  }
+  return value_to_bound_var;
+}
+
+class PatternBasedPartitioner : ExprVisitor {
+ public:
+  using Group = GraphPartitioner::Group;
+  using ExprVisitor::VisitExpr_;
+
+  static std::unordered_map<const Object*, Group*> Run(DFPattern pattern, Expr expr,
+                                                       support::Arena* arena) {
+    PatternBasedPartitioner part(pattern, AnalyzeVar2Value(expr));
+    PostOrderVisit(
+        expr, [arena, &part](const Expr& e) { part.group_map_[e.get()] = arena->make<Group>(); });
+    part.VisitExpr(expr);
+    return part.group_map_;
+  }
+
+  PatternBasedPartitioner(DFPattern pattern, const tvm::runtime::Map<Var, Expr>& bindings)
+      : pat_(pattern), bindings_(bindings), value_to_bound_var_(GetBindingInverse(bindings)) {}
+
+  void VisitBindingBlock_(const DataflowBlockNode* block) final {
+    for (const auto& binding : block->bindings) {
+      auto it = group_map_.find(binding->var.get());
+      ICHECK(it != group_map_.end());
+      if (const auto* var_binding = binding.as<VarBindingNode>()) {
+        VisitExpr(var_binding->value);
+      }
+    }
+  }
+
+  void VisitExpr_(const CallNode* call) override {
+    if (auto matches_opt = ExtractMatchedExpr(pat_, GetRef<Call>(call), bindings_)) {
+      auto parent_group = GetGroupForBoundVar(GetRef<Call>(call));
+      ICHECK(parent_group);
+
+      for (const auto& [_, match] : matches_opt.value()) {
+        ICHECK(group_map_.count(match.get()));
+        if (!match->IsInstance<OpNode>()) {
+          AddToGroup(match, parent_group);
+          if (value_to_bound_var_.count(match) && GetGroupForBoundVar(match)->num_nodes == 1) {
+            AddToGroup(value_to_bound_var_[match], parent_group);
+          }
+        }
+      }
+    }
+  }
+
+ private:
+  void AddToGroup(Expr e, Group* to) {
+    if (group_map_[e.get()] != to) {
+      --group_map_[e.get()]->num_nodes;
+      group_map_[e.get()] = to;
+      ++to->num_nodes;
+    }
+  }
+
+  Group* GetGroupForBoundVar(Expr e) {
+    ICHECK(value_to_bound_var_.count(e));
+    auto bound_var = value_to_bound_var_[e];
+    ICHECK(group_map_.count(bound_var.get()));
+    return group_map_[bound_var.get()];
+  }
+
+  DFPattern pat_;
+  Map<Var, Expr> bindings_;
+  Map<Expr, Var> value_to_bound_var_;
+  std::unordered_map<const Object*, Group*> group_map_;
+};
+
+IRModule FuseOpsByPattern(DFPattern pattern, IRModule mod) {
+  std::unordered_map<const Object*, PatternBasedPartitioner::Group*> group_map;
+  support::Arena arena;
+  for (const auto& [gv, func] : mod->functions) {
+    auto map = PatternBasedPartitioner::Run(pattern, func, &arena);
+    group_map.insert(map.begin(), map.end());
+  }
   return OperatorFusor(mod, group_map).Transform();
 }
 
@@ -785,6 +868,17 @@ Pass FuseOps(int fuse_opt_level) {
 }
 
 TVM_REGISTER_GLOBAL("relax.transform.FuseOps").set_body_typed(FuseOps);
+
+Pass FuseOpsByPattern(DFPattern pattern) {
+  runtime::TypedPackedFunc<IRModule(IRModule, PassContext)> pass_func =  //
+      [=](IRModule m, PassContext pc) { return relax::FuseOpsByPattern(pattern, m); };
+  return CreateModulePass(/*pass_function=*/pass_func,       //
+                          /*opt_level=*/0,                   //
+                          /*pass_name=*/"FuseOpsByPattern",  //
+                          /*required=*/{});
+}
+
+TVM_REGISTER_GLOBAL("relax.transform.FuseOpsByPattern").set_body_typed(FuseOpsByPattern);
 
 }  // namespace transform
 

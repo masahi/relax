@@ -40,8 +40,6 @@
 #include <utility>
 #include <vector>
 
-#include "../../relay/analysis/graph_partitioner.h"
-#include "../transform/fuse_ops.h"
 #include "dataflow_matcher_impl.h"
 
 namespace tvm {
@@ -501,13 +499,30 @@ bool DFPatternMatcher::VisitDFPattern_(const WildcardPatternNode* op, const Expr
 }
 
 bool MatchExpr(DFPattern pattern, Expr expr, Optional<runtime::Map<Var, Expr>> var2val) {
-  if (var2val.defined())  // autojump is enabled with var2val.
+  if (var2val)  // autojump is enabled with var2val.
     return DFPatternMatcher(std::move(var2val.value())).Match(pattern, expr);
   else
     return DFPatternMatcher().Match(pattern, expr);
 }
 
 TVM_REGISTER_GLOBAL("relax.dpl.match_expr").set_body_typed(MatchExpr);
+
+Optional<Map<DFPattern, Expr>> ExtractMatchedExpr(DFPattern pattern, Expr expr,
+                                                  Optional<Map<Var, Expr>> bindings_opt) {
+  auto bindings = bindings_opt ? bindings_opt.value() : Map<Var, Expr>{};
+  DFPatternMatcher matcher(bindings);
+
+  if (!matcher.Match(pattern, expr)) {
+    return NullOpt;
+  }
+
+  Map<DFPattern, Expr> matching;
+  for (const auto& [pat, matches] : matcher.GetMemo()) {
+    ICHECK(matches.size() == 1) << "More than one match for the pattern " << pat;
+    matching.Set(pat, matches[0]);
+  }
+  return matching;
+}
 
 struct PNode {
   const DFPatternNode* ptr;
@@ -751,102 +766,6 @@ tvm::runtime::Map<DFPattern, Var> MatchGraph(const PatternContext& ctx, const Da
 }
 
 TVM_REGISTER_GLOBAL("relax.dpl.match_dfb").set_body_typed(MatchGraph);
-
-class CollectBoundVarMap : public relax::ExprVisitor {
- public:
-  tvm::runtime::Map<Expr, Var> expr_to_bound_var;
-
-  void VisitBinding_(const VarBindingNode* binding) override {
-    PostOrderVisit(binding->value, [this, binding](const Expr& n) {
-      if (!n->IsInstance<OpNode>()) {
-        expr_to_bound_var.Set(n, binding->var);
-      }
-    });
-  }
-};
-
-class Partitioner : ExprVisitor {
- public:
-  using Group = relay::GraphPartitioner::Group;
-  using ExprVisitor::VisitExpr_;
-
-  static std::unordered_map<const Object*, Group*> Run(DFPattern pattern, Expr expr,
-                                                       support::Arena* arena) {
-    CollectBoundVarMap bound_var_map;
-    bound_var_map(expr);
-
-    Partitioner part(pattern, AnalyzeVar2Value(expr), bound_var_map.expr_to_bound_var);
-    PostOrderVisit(expr, [arena, &part](const Expr& n) {
-      auto* g = arena->make<Group>();
-      part.group_map_[n.get()] = g;
-    });
-    part.VisitExpr(expr);
-    return part.group_map_;
-  }
-
-  Partitioner(DFPattern pattern, tvm::runtime::Map<Var, Expr> binding,
-              tvm::runtime::Map<Expr, Var> expr_to_bound_var)
-      : pat_(pattern), matcher_(binding), expr_to_bound_var_(expr_to_bound_var) {}
-
-  void VisitBindingBlock_(const DataflowBlockNode* block) final {
-    for (auto binding : block->bindings) {
-      LOG(INFO) << binding->var->name_hint();
-      auto it = group_map_.find(binding->var.get());
-      ICHECK(it != group_map_.end());
-      current_binding_group_ = it->second;
-      if (const auto* var_binding = binding.as<VarBindingNode>()) {
-        VisitExpr(var_binding->value);
-      }
-    }
-  }
-
-  void VisitExpr_(const CallNode* call) override {
-    ExprVisitor::VisitExpr_(call);
-    if (matcher_.Match(pat_, GetRef<Call>(call))) {
-      ICHECK(current_binding_group_);
-
-      auto nodemap = matcher_.GetMemo();
-      for (const auto& [pat, matches] : nodemap) {
-        for (const auto& match : matches) {
-          ICHECK(group_map_.count(match.get()));
-          if (!match->IsInstance<OpNode>() && group_map_[match.get()] != current_binding_group_) {
-            LOG(INFO) << "Add " << match;
-            --group_map_[match.get()]->num_nodes;
-            group_map_[match.get()] = current_binding_group_;
-            ++current_binding_group_->num_nodes;
-            ICHECK(expr_to_bound_var_.count(match));
-            if (group_map_[expr_to_bound_var_[match].get()] != current_binding_group_ &&
-                group_map_[expr_to_bound_var_[match].get()]->num_nodes == 1) {
-              LOG(INFO) << "Update group for bound var " << expr_to_bound_var_[match]->name_hint();
-              --group_map_[expr_to_bound_var_[match].get()]->num_nodes;
-              group_map_[expr_to_bound_var_[match].get()] = current_binding_group_;
-              ++current_binding_group_->num_nodes;
-            }
-          }
-        }
-      }
-    }
-  }
-
- private:
-  DFPattern pat_;
-  DFPatternMatcher matcher_;
-  std::unordered_map<const Object*, Group*> group_map_;
-  Group* current_binding_group_;
-  tvm::runtime::Map<Expr, Var> expr_to_bound_var_;
-};
-
-IRModule PartitionByPattern(DFPattern pattern, IRModule mod) {
-  std::unordered_map<const Object*, Partitioner::Group*> group_map;
-  support::Arena arena;
-  for (const auto& [gv, func] : mod->functions) {
-    auto map = Partitioner::Run(pattern, func, &arena);
-    group_map.insert(map.begin(), map.end());
-  }
-  return GroupOps(mod, group_map);
-}
-
-TVM_REGISTER_GLOBAL("relax.dpl.partition").set_body_typed(PartitionByPattern);
 
 }  // namespace relax
 }  // namespace tvm
