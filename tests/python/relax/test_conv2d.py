@@ -283,7 +283,37 @@ def test_dnnl_offload():
     print(np.max(np.abs(out - ref)), np.mean(np.abs(out - ref)))
 
 
+def test_cutlass_offload():
+    seq = tvm.transform.Sequential([
+        relax.transform.RunCodegen(),
+        relax.transform.RemoveUnusedFunctions(),
+    ])
+
+    mod = seq(Conv2dReLUx2Partitioned)
+    print(mod.script())
+
+    target = tvm.target.Target("cuda")
+    ex = relax.vm.build(mod, target)
+
+    vm = relax.VirtualMachine(ex, tvm.cpu())
+    f = vm["main"]
+
+    data_np = np.random.randn(1, 64, 56, 56).astype("float32")
+    weight1_np = np.random.randn(64, 64, 3, 3).astype("float32")
+    weight2_np = np.random.randn(64, 64, 3, 3).astype("float32")
+    out = f(tvm.nd.array(data_np), tvm.nd.array(weight1_np), tvm.nd.array(weight2_np)).numpy()
+
+    relay_mod = tvm.IRModule.from_expr(get_relay_conv2d_relu_x2(data_np.shape, weight1_np.shape))
+
+    ref = (
+        relay.create_executor("graph", mod=relay_mod, device=tvm.cpu(0), target="llvm")
+        .evaluate()(*[data_np, weight1_np, weight2_np])
+        .numpy()
+    )
+
+    print(np.max(np.abs(out - ref)), np.mean(np.abs(out - ref)))
+
+
 if __name__ == "__main__":
     # test_conv2d_partition()
-    test_dnnl_offload()
-    # test_dnnl_relay()
+    test_cutlass_offload()
