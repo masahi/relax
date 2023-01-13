@@ -148,5 +148,116 @@ def test_conv2d_partition():
     print(np.max(np.abs(out - ref)), np.mean(np.abs(out - ref)))
 
 
+def partition_for_dnnl_relay(mod, params=None):
+    from tvm.relay.build_module import bind_params_by_name
+    from tvm.relay.op.contrib import dnnl
+    from tvm.relay import transform
+
+    if params:
+        mod["main"] = bind_params_by_name(mod["main"], params)
+
+    seq = tvm.transform.Sequential(
+        [
+            transform.CanonicalizeOps(),
+            transform.InferType(),
+            transform.SimplifyInference(),
+            transform.FoldConstant(),
+            transform.FoldScaleAxis(),
+            transform.SimplifyExpr(),
+            transform.FoldConstant(),
+            transform.Legalize(),
+            transform.FoldConstant(),
+        ]
+    )
+    with tvm.transform.PassContext(opt_level=3):
+        mod = seq(mod)
+
+    byoc_seq = tvm.transform.Sequential(
+        [
+            transform.MergeComposite(dnnl.pattern_table()),
+            transform.AnnotateTarget("dnnl"),
+            transform.MergeCompilerRegions(),
+            transform.PartitionGraph(),
+        ]
+    )
+
+    with tvm.transform.PassContext(opt_level=3):
+        mod = byoc_seq(mod)
+
+    return mod
+
+
+def test_dnnl_relay():
+    data_np = np.random.randn(1, 64, 56, 56).astype("float32")
+    weight1_np = np.random.randn(64, 64, 3, 3).astype("float32")
+    weight2_np = np.random.randn(64, 64, 3, 3).astype("float32")
+
+    relay_mod = tvm.IRModule.from_expr(get_relay_conv2d_relu_x2(data_np.shape, weight1_np.shape))
+
+    mod = partition_for_dnnl_relay(relay_mod)
+    print(mod)
+    return
+    target = "llvm"
+    dev = tvm.device(target, 0)
+
+    with tvm.transform.PassContext(opt_level=3):
+        func = relay.create_executor(
+            "graph", mod=mod, device=dev, target=target
+        ).evaluate()
+
+
+@tvm.script.ir_module
+class Conv2dReLUx2Partitioned:
+    @R.function
+    def main(data: R.Tensor((1, 64, 56, 56), dtype="float32"), weight1: R.Tensor((64, 64, 3, 3), dtype="float32"), weight2: R.Tensor((64, 64, 3, 3), dtype="float32")) -> R.Tensor((1, 64, 54, 54), dtype="float32"):
+        # block 0
+        with R.dataflow():
+            lv: R.Tensor((1, 64, 56, 56), dtype="float32") = fused_relax_nn_conv2d_relax_nn_relu(data, weight1)
+            gv: R.Tensor((1, 64, 54, 54), dtype="float32") = fused_relax_nn_conv2d_relax_nn_relu1(lv, weight2)
+            R.output(gv)
+        return gv
+
+    @R.function
+    def fused_relax_nn_conv2d_relax_nn_relu(data1: R.Tensor((1, 64, 56, 56), dtype="float32"), weight11: R.Tensor((64, 64, 3, 3), dtype="float32")) -> R.Tensor((1, 64, 56, 56), dtype="float32"):
+        R.func_attr({"Codegen": "dnnl", "global_symbol": "fused_relax_nn_conv2d_relax_nn_relu"})
+
+        @R.function
+        def fused_relax_nn_conv2d_relax_nn_relu_inner(data1: R.Tensor((1, 64, 56, 56), dtype="float32"), weight11: R.Tensor((64, 64, 3, 3), dtype="float32")) -> R.Tensor((1, 64, 56, 56), dtype="float32"):
+            # function attr dict
+            R.func_attr({"Primitive": 1, "Composite": "conv2d_relu"})
+            # block 0
+            with R.dataflow():
+                lv1: R.Tensor((1, 64, 56, 56), dtype="float32") = R.nn.conv2d(data1, weight11, strides=[1, 1], padding=[1, 1, 1, 1], dilation=[1, 1], data_layout="NCHW", kernel_layout="OIHW", out_layout="NCHW", out_dtype="")
+                gv1: R.Tensor((1, 64, 56, 56), dtype="float32") = R.nn.relu(lv1)
+                R.output(gv1)
+            return gv1
+
+        return fused_relax_nn_conv2d_relax_nn_relu_inner(data1, weight11)
+
+
+    @R.function
+    def fused_relax_nn_conv2d_relax_nn_relu1(conv1: R.Tensor((1, 64, 56, 56), dtype="float32"), weight21: R.Tensor((64, 64, 3, 3), dtype="float32")) -> R.Tensor((1, 64, 54, 54), dtype="float32"):
+        R.func_attr({"Codegen": "dnnl", "global_symbol": "fused_relax_nn_conv2d_relax_nn_relu1"})
+        @R.function
+        def fused_relax_nn_conv2d_relax_nn_relu1_inner(conv1: R.Tensor((1, 64, 56, 56), dtype="float32"), weight21: R.Tensor((64, 64, 3, 3), dtype="float32")) -> R.Tensor((1, 64, 54, 54), dtype="float32"):
+            # function attr dict
+            R.func_attr({"Primitive": 1, "Composite": "conv2d_relu"})
+            # block 0
+            with R.dataflow():
+                lv2: R.Tensor((1, 64, 54, 54), dtype="float32") = R.nn.conv2d(conv1, weight21, strides=[1, 1], padding=[0, 0, 0, 0], dilation=[1, 1], data_layout="NCHW", kernel_layout="OIHW", out_layout="NCHW", out_dtype="")
+                gv2: R.Tensor((1, 64, 54, 54), dtype="float32") = R.nn.relu(lv2)
+                R.output(gv2)
+            return gv2
+
+        return fused_relax_nn_conv2d_relax_nn_relu1_inner(conv1, weight21)
+
+
+def test_dnnl_offload():
+    relax.transform.RunCodegen()(Conv2dReLUx2Partitioned)
+#    print(
+
+
 if __name__ == "__main__":
-    test_conv2d_partition()
+    # test_conv2d_partition()
+    test_dnnl_offload()
+    # test_dnnl_relay()

@@ -358,7 +358,7 @@ class JSONSerializer
 
     // TODO(@sunggg): Revisit when we have op naming convention.
     // Currently, simply remove "relax." prefix to make it work.
-    name = std::string("tensorrt.") + name.substr(6);
+    name = std::string("dnnl.") + name.substr(6);
 
     std::vector<JSONGraphNodeEntry> inputs;
     for (const auto& arg : cn->args) {
