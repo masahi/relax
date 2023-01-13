@@ -76,7 +76,6 @@ class DNNLJSONSerializer : public JSONSerializer {
     const CallNode* root_call = call_node;
     if (name.find("conv2d") != std::string::npos) {
       for (auto [var, val]: bindings_) {
-	LOG(INFO) << var->name_hint() << ", " << val;
 	if (val->IsInstance<CallNode>() && IsOp(val.as<CallNode>(), "relax.nn.conv2d")) {
 	  root_call = val.as<CallNode>();
 	  break;
@@ -115,7 +114,6 @@ runtime::Module DNNLCompiler(const ObjectRef& ref) {
   DNNLJSONSerializer serializer(func_name, func);
   serializer.serialize();
   std::string graph_json = serializer.GetJSON();
-  LOG(INFO) << "DNNL JSON:" << std::endl << graph_json;
   auto param_names = serializer.GetParams();
   const auto* pf = runtime::Registry::Get("runtime.DNNLJSONRuntimeCreate");
   ICHECK(pf != nullptr) << "Cannot find DNNL runtime module create function.";
