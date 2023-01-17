@@ -419,7 +419,7 @@ class FunctionCreator : public ExprMutator {
    * \brief Create the grouped function according according to the collected bindings and parameters
    * \note The created function won't be returned immediately. It's stored in the `function_` field.
    */
-  void CreateFunction() {
+  void CreateFunction(const std::string& composite_name) {
     // Step 1. Start constructing a new dataflow block.
     builder_->BeginDataflowBlock();
 
@@ -449,6 +449,9 @@ class FunctionCreator : public ExprMutator {
     body = builder_->Normalize(SeqExpr({new_block}, body));
     Map<String, ObjectRef> attrs;
     attrs.Set(tvm::relax::attr::kPrimitive, Integer(1));
+    if (!composite_name.empty()) {
+      attrs.Set(tvm::relax::attr::kComposite, String(composite_name));
+    }
     function_ = Function(/*params=*/params_,           //
                          /*body=*/body,                //
                          /*ret_struct_info=*/NullOpt,  //
@@ -591,8 +594,8 @@ class OperatorFusor : public ExprMutator {
     CollectFuncBoundary(block->bindings);
 
     // Step 3. Create the grouped function for each group.
-    for (auto& [_, creator] : group2func_) {
-      creator.CreateFunction();
+    for (auto& [g, creator] : group2func_) {
+      creator.CreateFunction(g->composite_name);
     }
 
     // Step 4. Start generating the new binding block.
@@ -781,17 +784,26 @@ class PatternBasedPartitioner : ExprVisitor {
   using Group = GraphPartitioner::Group;
   using ExprVisitor::VisitExpr_;
 
-  static std::unordered_map<const Object*, Group*> Run(DFPattern pattern, Expr expr,
-                                                       support::Arena* arena) {
-    PatternBasedPartitioner part(pattern, AnalyzeVar2Value(expr));
-    PostOrderVisit(
-        expr, [arena, &part](const Expr& e) { part.group_map_[e.get()] = arena->make<Group>(); });
-    part.VisitExpr(expr);
-    return part.group_map_;
+  static std::unordered_map<const Object*, Group*> Run(
+      const tvm::Array<runtime::String>& pattern_names, const tvm::Array<DFPattern>& patterns,
+      Expr expr, support::Arena* arena) {
+    std::unordered_map<const Object*, Group*> group_map;
+    for (size_t i = 0; i < patterns.size(); ++i) {
+      PatternBasedPartitioner part(pattern_names[i], patterns[i], AnalyzeVar2Value(expr));
+      PostOrderVisit(
+          expr, [arena, &part](const Expr& e) { part.group_map_[e.get()] = arena->make<Group>(); });
+      part.VisitExpr(expr);
+      group_map.insert(part.group_map_.begin(), part.group_map_.end());
+    }
+    return group_map;
   }
 
-  PatternBasedPartitioner(DFPattern pattern, const tvm::runtime::Map<Var, Expr>& bindings)
-      : pat_(pattern), bindings_(bindings), value_to_bound_var_(GetBindingInverse(bindings)) {}
+  PatternBasedPartitioner(const std::string& pattern_name, DFPattern pattern,
+                          const tvm::runtime::Map<Var, Expr>& bindings)
+      : pat_name_(pattern_name),
+        pat_(pattern),
+        bindings_(bindings),
+        value_to_bound_var_(GetBindingInverse(bindings)) {}
 
   void VisitBindingBlock_(const DataflowBlockNode* block) final {
     for (const auto& binding : block->bindings) {
@@ -807,6 +819,7 @@ class PatternBasedPartitioner : ExprVisitor {
     if (auto matches_opt = ExtractMatchedExpr(pat_, GetRef<Call>(call), bindings_)) {
       auto parent_group = GetGroupForBoundVar(GetRef<Call>(call));
       ICHECK(parent_group);
+      parent_group->composite_name = pat_name_;
 
       for (const auto& [_, match] : matches_opt.value()) {
         ICHECK(group_map_.count(match.get()));
@@ -836,17 +849,19 @@ class PatternBasedPartitioner : ExprVisitor {
     return group_map_[bound_var.get()];
   }
 
+  const std::string& pat_name_;
   DFPattern pat_;
   Map<Var, Expr> bindings_;
   Map<Expr, Var> value_to_bound_var_;
   std::unordered_map<const Object*, Group*> group_map_;
 };
 
-IRModule FuseOpsByPattern(DFPattern pattern, IRModule mod) {
+IRModule FuseOpsByPattern(const tvm::Array<runtime::String>& pattern_names,
+                          const tvm::Array<DFPattern>& patterns, IRModule mod) {
   std::unordered_map<const Object*, PatternBasedPartitioner::Group*> group_map;
   support::Arena arena;
   for (const auto& [gv, func] : mod->functions) {
-    auto map = PatternBasedPartitioner::Run(pattern, func, &arena);
+    auto map = PatternBasedPartitioner::Run(pattern_names, patterns, func, &arena);
     group_map.insert(map.begin(), map.end());
   }
   return OperatorFusor(mod, group_map).Transform();
@@ -869,9 +884,12 @@ Pass FuseOps(int fuse_opt_level) {
 
 TVM_REGISTER_GLOBAL("relax.transform.FuseOps").set_body_typed(FuseOps);
 
-Pass FuseOpsByPattern(DFPattern pattern) {
+Pass FuseOpsByPattern(const tvm::Array<runtime::String>& pattern_names,
+                      const tvm::Array<DFPattern>& patterns) {
   runtime::TypedPackedFunc<IRModule(IRModule, PassContext)> pass_func =  //
-      [=](IRModule m, PassContext pc) { return relax::FuseOpsByPattern(pattern, m); };
+      [=](IRModule m, PassContext pc) {
+        return relax::FuseOpsByPattern(pattern_names, patterns, m);
+      };
   return CreateModulePass(/*pass_function=*/pass_func,       //
                           /*opt_level=*/0,                   //
                           /*pass_name=*/"FuseOpsByPattern",  //

@@ -79,7 +79,7 @@ def get_relay_conv2d_relu_x2(d_shape, w_shape):
 def test_conv2d_partition():
     mod = Conv2dReLUx2
     pat = make_conv_pattern("relax.nn.conv2d", False, "relax.nn.relu")
-    mod = relax.transform.FuseOpsByPattern(pat)(mod)
+    mod = relax.transform.FuseOpsByPattern(["cutlass.conv2d_relu"], [pat])(mod)
     print(mod.script())
 
 

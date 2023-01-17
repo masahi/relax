@@ -287,9 +287,9 @@ def FuseOps(fuse_opt_level=-1) -> tvm.ir.transform.Pass:
     return _ffi_api.FuseOps(fuse_opt_level)  # type: ignore
 
 
-def FuseOpsByPattern(pattern: DFPattern) -> tvm.ir.transform.Pass:
+def FuseOpsByPattern(pattern_names: List[str], patterns: List[DFPattern]) -> tvm.ir.transform.Pass:
     """TODO"""
-    return _ffi_api.FuseOpsByPattern(pattern)  # type: ignore
+    return _ffi_api.FuseOpsByPattern(pattern_names, patterns)  # type: ignore
 
 
 def FuseTIR() -> tvm.ir.transform.Pass:

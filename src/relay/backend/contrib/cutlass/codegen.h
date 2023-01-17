@@ -82,6 +82,7 @@ GenerateBodyOutput GenerateBody(const std::string& func_name, const std::string&
                                 const Str2StrMap& attribute_args, int* buf_idx);
 
 runtime::Module Finalize(const std::string& code, const Array<String>& func_names);
+
 /*!
  * \brief Returns the pass which replaces all calls to "Primitive" functions with "Compiler"
  * attribute of "cutlass" with an call to an extern, and binds a \p runtime::StaticLibrary
