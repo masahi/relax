@@ -29,12 +29,8 @@ from tvm.relay.op.contrib.cutlass import partition_for_cutlass
 from tvm import relay
 from tvm.relay import testing
 import tvm.testing
-from tvm.contrib.cutlass import (
-    has_cutlass,
-    num_cutlass_partitions,
-    finalize_modules,
-    finalize_modules_vm,
-)
+from tvm.contrib.cutlass import finalize_modules
+
 
 img_size = 8
 #######################################################################

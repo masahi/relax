@@ -73,6 +73,7 @@ class DNNLJSONRuntime : public JSONRuntimeBase {
 
   /* Thread safe implementation of Run. Keep runtime instance immutable */
   void Run(const TVMArgs& args) const {
+    LOG(INFO) << "Running DNNL";
     auto arg_data_provider = makeIODataProvider(args);
     auto mem_solver = tensor_registry_.MakeSolver(arg_data_provider);
     // Execute primitives one by one
@@ -316,7 +317,8 @@ class DNNLJSONRuntime : public JSONRuntimeBase {
     auto padding = GetNodeAttr<std::vector<int64_t>>(node, "padding");
     std::vector<int64_t> padding_l(padding.begin(), padding.begin() + padding.size() / 2);
     std::vector<int64_t> padding_r(padding.begin() + padding.size() / 2, padding.end());
-    auto groups = GetNodeAttr<int>(node, "groups");
+    // todo: groups attribute missing in Relax conv2d
+    auto groups = 1;  // GetNodeAttr<int>(node, "groups");
     auto src_layout = GetNodeAttr<std::string>(node, "data_layout");
     auto dst_layout = GetNodeAttr<std::string>(node, "out_layout");
     auto wgh_layout = GetNodeAttr<std::string>(node, "kernel_layout");

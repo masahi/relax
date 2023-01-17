@@ -18,42 +18,23 @@
  */
 
 /*!
- * \file src/relay/backend/contrib/cutlass/codegen.cc
- * \brief The 'custom' compilation pass for CUTLASS (invoked by the RelayToTIRTargetHook pass).
+ * \file src/relax/backend/contrib/cutlass/codegen.cc
+ * \brief Implementation of the CUTLASS JSON serializer.
  */
+#include <tvm/ir/module.h>
+#include <tvm/relax/analysis.h>
+#include <tvm/relax/attrs/nn.h>
+#include <tvm/relax/type.h>
 
-#include <tvm/relay/attrs/memory.h>
-#include <tvm/relay/attrs/nn.h>
-#include <tvm/relay/transform.h>
-#include <tvm/relay/type.h>
-#include <tvm/runtime/module.h>
-#include <tvm/runtime/registry.h>
+#include <memory>
+#include <string>
+#include <vector>
 
-#include <numeric>
-#include <sstream>
-
-#include "../../../transforms/compiler_function_utils.h"
-#include "../../utils.h"
-#include "../codegen_c/codegen_c.h"
+#include "../utils.h"
 
 namespace tvm {
-namespace relay {
+namespace relax {
 namespace contrib {
-namespace cutlass {
-
-namespace {
-
-/*! \brief Return the "cutlass" Target instance to use to guide compilation. */
-Target GetCutlassTarget() {
-  Target target = Target::Current(/*allow_not_defined=*/true);
-  if (!target.defined() || target->kind->name != "cutlass") {
-    // Use the default CUTLASS compilation options if no specific "cutlass" target was given
-    // in the overall targets list. In that case target_hooks.cc will invoke the custom pass
-    // without pushing any target instance onto the implicit target stack.
-    target = Target("cutlass");
-  }
-  return target;
-}
 
 using Str2StrMap = std::unordered_map<std::string, std::string>;
 
@@ -521,16 +502,33 @@ std::string Conv2dOp(std::string id, const Str2StrMap& attrs,
   return conv2d_decl.str();
 }
 
-class CodegenCutlass : public backend::MemoizedExprTranslator<std::vector<Output>>,
-                       public CodegenCBase {
+struct Output {
+  std::string name;
+  std::string dtype;
+  int size;
+  bool need_copy;
+};
+
+struct GenerateBodyOutput {
+  std::string decl;
+  std::vector<std::string> buffers;
+  std::vector<Output> outputs;
+};
+
+inline bool IsOp(const CallNode* call, const std::string& op_name) {
+  const auto* op_node = call->op.as<OpNode>();
+  if (!op_node) return false;
+  Op op = GetRef<Op>(op_node);
+  return op == Op::Get(op_name);
+}
+
+class CodegenCutlass : public tvm::relax::backend::MemoizedExprTranslator<std::vector<Output>> {
  public:
-  CodegenCutlass(const std::string& id, const Map<String, ObjectRef>& attrs) {
+  CodegenCutlass(const std::string& id, const Map<String, ObjectRef>& attrs, const Expr& expr) {
+    // todo: clean up
     this->ext_func_id_ = id;
     this->attrs_ = attrs;
-  }
-
-  std::vector<Output> VisitExprDefault_(const Object* op) final {
-    LOG(FATAL) << "Cutlass codegen doesn't support: " << op->GetTypeKey();
+    bindings_ = AnalyzeVar2Value(expr);
   }
 
   std::vector<Output> VisitExpr_(const VarNode* node) final {
@@ -541,14 +539,17 @@ class CodegenCutlass : public backend::MemoizedExprTranslator<std::vector<Output
   }
 
   std::vector<Output> VisitExpr_(const CallNode* call) final {
-    const auto* func = call->op.as<FunctionNode>();
-    ICHECK(func) << "Only composite function is supported for CUTLASS.";
+    const auto* fn_var = call->op.as<VarNode>();
+    ICHECK(fn_var);
+    const auto func = Downcast<Function>(bindings_[GetRef<Var>(fn_var)]);
+    ICHECK(func.defined()) << "Only composite function is supported for CUTLASS.";
     GenerateBodyOutput ret = GenerateCompositeFunctionCall(func, call);
     ext_func_body_.push_back(ret.decl);
     return ret.outputs;
   }
 
   std::string JIT(const std::vector<Output>& out) {
+    CHECK(out.size() > 0);
     code_stream_ << "void " << ext_func_id_ << "_(";
 
     for (const auto& arg : ext_func_args_) {
@@ -578,6 +579,79 @@ class CodegenCutlass : public backend::MemoizedExprTranslator<std::vector<Output
     return code_stream_.str();
   }
 
+  /*! \brief The external function source code stream. */
+  std::ostringstream code_stream_;
+
+ protected:
+  std::vector<Output> VisitExpr_(const FunctionNode* fn) {
+    ICHECK(fn->GetAttr<String>(attr::kComposite).defined())
+        << "JSON runtime only supports composite functions";
+    // FunctionNode should be handled by the caller.
+    return {};
+  }
+
+  std::vector<Output> VisitBinding_(const VarBindingNode* binding) {
+    ICHECK_EQ(memo_.count(binding->var), 0);
+    memo_[binding->var] = VisitExpr(binding->value);
+    return VisitExpr(binding->value);
+  }
+
+  std::vector<Output> VisitBinding(const Binding& binding) {
+    std::vector<Output> nodes;
+    if (const auto* node = binding.as<VarBindingNode>()) {
+      auto from_b = VisitBinding_(node);
+      nodes.insert(nodes.end(), from_b.begin(), from_b.end());
+    } else {
+      LOG(FATAL) << "Unimplemented type: " << binding->GetTypeKey();
+    }
+    return nodes;
+  }
+
+  std::vector<Output> VisitBindingBlock(const BindingBlock& block) {
+    std::vector<Output> nodes;
+    if (const auto* node = block.as<DataflowBlockNode>()) {
+      auto from_bb = VisitBindingBlock_(node);
+      nodes.insert(nodes.end(), from_bb.begin(), from_bb.end());
+    } else if (const auto* node = block.as<BindingBlockNode>()) {
+      auto from_bb = VisitBindingBlock_(node);
+      nodes.insert(nodes.end(), from_bb.begin(), from_bb.end());
+    } else {
+      LOG(FATAL) << "TypeError: Invalid type: " << block->GetTypeKey();
+    }
+    return nodes;
+  }
+
+  std::vector<Output> VisitBindingBlock_(const BindingBlockNode* block) {
+    std::vector<Output> nodes;
+    for (Binding binding : block->bindings) {
+      auto from_b = VisitBinding(binding);
+      nodes.insert(nodes.end(), from_b.begin(), from_b.end());
+    }
+    return nodes;
+  }
+
+  std::vector<Output> VisitBindingBlock_(const DataflowBlockNode* block) {
+    std::vector<Output> nodes;
+    for (Binding binding : block->bindings) {
+      auto from_b = VisitBinding(binding);
+      nodes.insert(nodes.end(), from_b.begin(), from_b.end());
+    }
+    return nodes;
+  }
+
+  std::vector<Output> VisitExpr_(const SeqExprNode* op) {
+    std::vector<Output> nodes;
+
+    for (BindingBlock block : op->blocks) {
+      auto from_bb = VisitBindingBlock(block);
+    }
+
+    auto from_body = VisitExpr(op->body);
+    nodes.insert(nodes.end(), from_body.begin(), from_body.end());
+
+    return nodes;
+  }
+
  private:
   std::vector<std::string> GetArgumentNames(const CallNode* call) {
     std::vector<std::string> arg_names;
@@ -590,145 +664,24 @@ class CodegenCutlass : public backend::MemoizedExprTranslator<std::vector<Output
     return arg_names;
   }
 
-  bool IsConv2dResidualBlock(const std::string& func_name) {
-    return func_name.find("conv2d") != std::string::npos &&
-           func_name.find("residual") != std::string::npos;
-  }
-
-  // Is node `x` an ancestor of `y`?
-  bool IsAncestor(const CallNode* x, const CallNode* y) {
-    if (x == y) return true;
-    for (auto arg : y->args) {
-      const CallNode* arg_ptr = arg.as<CallNode>();
-      if (arg_ptr && IsAncestor(x, arg_ptr)) return true;
-    }
-    return false;
-  }
-
-  GenerateBodyOutput GenerateCompositeFunctionCall(const FunctionNode* callee,
-                                                   const CallNode* caller) {
-    using backend::GetRootCall;
-
+  GenerateBodyOutput GenerateCompositeFunctionCall(Function callee, const CallNode* caller) {
     const auto pattern_name = callee->GetAttr<runtime::String>(attr::kComposite);
     ICHECK(pattern_name.defined()) << "Only functions with composite attribute are supported.";
 
-    if (pattern_name == "cutlass.dense") {
-      const auto* dense_call =
-          GetRootCall(callee->body.as<CallNode>(), 0, std::vector<std::string>{"nn.dense"});
-      return GenerateBody(dense_call, "cutlass_dense", GetArgumentNames(caller),
-                          DenseArgs(std::ref(attrs_)));
-    } else if (pattern_name == "cutlass.dense_bias") {
-      const CallNode* current_call = callee->body.as<CallNode>();
-      std::string add_or_bias_add = current_call->op.as<OpNode>()->name;
-      const auto* dense_call =
-          GetRootCall(callee->body.as<CallNode>(), 1, {"nn.dense", add_or_bias_add});
-      return GenerateBody(dense_call, "cutlass_dense_bias", GetArgumentNames(caller),
-                          DenseArgs(std::ref(attrs_)));
-    } else if (pattern_name == "cutlass.dense_bias_relu") {
-      const CallNode* current_call = callee->body.as<CallNode>();
-      std::string add_or_bias_add = current_call->args[0].as<CallNode>()->op.as<OpNode>()->name;
-      const auto* dense_call =
-          GetRootCall(callee->body.as<CallNode>(), 2, {"nn.dense", add_or_bias_add, "nn.relu"});
-      return GenerateBody(dense_call, "cutlass_dense_bias_relu", GetArgumentNames(caller),
-                          DenseArgs(std::ref(attrs_)));
-    } else if (pattern_name == "cutlass.dense_bias_gelu_fp16") {
-      const CallNode* current_call = callee->body.as<CallNode>();
-      std::string add_or_bias_add = current_call->args[1].as<CallNode>()->op.as<OpNode>()->name;
-      const auto* dense_call = GetRootCall(callee->body.as<CallNode>(), 8,
-                                           {"nn.dense", add_or_bias_add, "multiply", "cast", "erf",
-                                            "cast", "multiply", "add", "multiply"});
-      return GenerateBody(dense_call, "cutlass_dense_bias_gelu", GetArgumentNames(caller),
-                          DenseArgs(std::ref(attrs_)));
-    } else if (pattern_name == "cutlass.dense_bias_gelu_fp32") {
-      const CallNode* current_call = callee->body.as<CallNode>();
-      std::string add_or_bias_add = current_call->args[1].as<CallNode>()->op.as<OpNode>()->name;
-      const auto* dense_call = GetRootCall(
-          callee->body.as<CallNode>(), 6,
-          {"nn.dense", add_or_bias_add, "multiply", "erf", "multiply", "add", "multiply"});
-      return GenerateBody(dense_call, "cutlass_dense_bias_gelu", GetArgumentNames(caller),
-                          DenseArgs(std::ref(attrs_)));
-    } else if (pattern_name == "cutlass.batch_matmul") {
-      const auto* batch_matmul_call =
-          GetRootCall(callee->body.as<CallNode>(), 0, std::vector<std::string>{"nn.batch_matmul"});
-      return GenerateBody(batch_matmul_call, "cutlass_batch_matmul", GetArgumentNames(caller),
-                          BatchMatmulArgs(std::ref(attrs_)));
-    } else if (pattern_name == "cutlass.conv2d") {
-      const auto* conv2d_call =
-          GetRootCall(callee->body.as<CallNode>(), 0, std::vector<std::string>{"nn.conv2d"});
-      return GenerateBody(conv2d_call, "cutlass_conv2d", GetArgumentNames(caller),
-                          Conv2dArgs(std::ref(attrs_)));
-    } else if (pattern_name == "cutlass.conv2d_bias") {
-      const CallNode* current_call = callee->body.as<CallNode>();
-      std::string add_or_bias_add = current_call->op.as<OpNode>()->name;
-      const auto* conv2d_call =
-          GetRootCall(callee->body.as<CallNode>(), 1, {"nn.conv2d", add_or_bias_add});
-      return GenerateBody(conv2d_call, "cutlass_conv2d_bias", GetArgumentNames(caller),
-                          Conv2dArgs(std::ref(attrs_)));
-    } else if (pattern_name == "cutlass.conv2d_bias_relu") {
-      const CallNode* current_call = callee->body.as<CallNode>();
-      std::string add_or_bias_add = current_call->args[0].as<CallNode>()->op.as<OpNode>()->name;
-      const auto* conv2d_call =
-          GetRootCall(callee->body.as<CallNode>(), 2, {"nn.conv2d", add_or_bias_add, "nn.relu"});
+    if (pattern_name == "conv2d_bias_relu") {
+      const CallNode* conv2d_call = caller;
+      for (auto [var, val] : bindings_) {
+        if (val->IsInstance<CallNode>() && IsOp(val.as<CallNode>(), "relax.nn.conv2d")) {
+          conv2d_call = val.as<CallNode>();
+          break;
+        }
+      }
       return GenerateBody(conv2d_call, "cutlass_conv2d_bias_relu", GetArgumentNames(caller),
                           Conv2dArgs(std::ref(attrs_)));
-    } else if (pattern_name == "cutlass.conv2d_bias_sigmoid") {
-      const CallNode* current_call = callee->body.as<CallNode>();
-      std::string add_or_bias_add = current_call->args[0].as<CallNode>()->op.as<OpNode>()->name;
-      const auto* conv2d_call =
-          GetRootCall(callee->body.as<CallNode>(), 2, {"nn.conv2d", add_or_bias_add, "sigmoid"});
-      return GenerateBody(conv2d_call, "cutlass_conv2d_bias_sigmoid", GetArgumentNames(caller),
-                          Conv2dArgs(std::ref(attrs_)));
-    } else if (pattern_name == "cutlass.conv2d_bias_silu") {
-      const CallNode* current_call = callee->body.as<CallNode>();
-      std::string add_or_bias_add = current_call->args[0].as<CallNode>()->op.as<OpNode>()->name;
-      const auto* conv2d_call =
-          GetRootCall(callee->body.as<CallNode>(), 2, {"nn.conv2d", add_or_bias_add, "multiply"});
-      return GenerateBody(conv2d_call, "cutlass_conv2d_bias_silu", GetArgumentNames(caller),
-                          Conv2dArgs(std::ref(attrs_)));
-    } else if (pattern_name == "cutlass.conv2d_bias_hardswish") {
-      const CallNode* current_call = callee->body.as<CallNode>();
-      std::string add_or_bias_add = current_call->args[0].as<CallNode>()->op.as<OpNode>()->name;
-      const auto* conv2d_call =
-          GetRootCall(callee->body.as<CallNode>(), 2, {"nn.conv2d", add_or_bias_add, "multiply"});
-      return GenerateBody(conv2d_call, "cutlass_conv2d_bias_hardswish", GetArgumentNames(caller),
-                          Conv2dArgs(std::ref(attrs_)));
-    } else if (IsConv2dResidualBlock(pattern_name.value())) {
-      const CallNode* current_call = callee->body.as<CallNode>();
-      bool has_relu = current_call->args.size() == 1;
-      const CallNode* binop = has_relu ? current_call->args[0].as<CallNode>() : current_call;
-      ICHECK(binop->args.size() == 2);
-      // Figure out which of the first or second argument corresponds to the residual input
-      // The root conv2d call can be reached via the other input of the binary op
-      int residual_index;
-      if (binop->args[1].as<VarNode>()) {
-        residual_index = 1;
-      } else if (binop->args[0].as<VarNode>()) {
-        residual_index = 0;
-      } else {
-        const CallNode* lhs = binop->args[0].as<CallNode>();
-        const CallNode* rhs = binop->args[1].as<CallNode>();
-        ICHECK(lhs && rhs);
-        // The residual input should be an ancestor of the non-residual input
-        residual_index = IsAncestor(rhs, lhs) ? 1 : 0;
-      }
-      const auto* non_residual_input = binop->args[!residual_index].as<CallNode>();
-      const auto* conv2d_call = GetRootCall(non_residual_input, "nn.conv2d");
-      ICHECK(conv2d_call);
-      return GenerateBody(conv2d_call, pattern_name.value(), GetArgumentNames(caller),
-                          Conv2dArgs(std::ref(attrs_)));
-    } else if (pattern_name == "cutlass.conv2d_transpose") {
-      const auto* conv2d_call = GetRootCall(callee->body.as<CallNode>(), 0,
-                                            std::vector<std::string>{"nn.conv2d_transpose"});
-      return GenerateBody(conv2d_call, "cutlass_conv2d_transpose", GetArgumentNames(caller),
-                          Conv2dArgs(std::ref(attrs_), true, false));
-    } else if (pattern_name == "cutlass.conv2d_backward_weight") {
-      const auto* conv2d_call = GetRootCall(callee->body.as<CallNode>(), 0,
-                                            std::vector<std::string>{"nn.conv2d_backward_weight"});
-      return GenerateBody(conv2d_call, "cutlass_conv2d_backward_weight", GetArgumentNames(caller),
-                          Conv2dArgs(std::ref(attrs_), false, true));
     }
 
     LOG(FATAL) << "Unknown composite function: " << pattern_name;
+    return {};
   }
 
   GenerateBodyOutput GenerateBody(const CallNode* root_call, const std::string& func_name,
@@ -742,26 +695,22 @@ class CodegenCutlass : public backend::MemoizedExprTranslator<std::vector<Output
       decl_stream << ", " << func_args[i];
     }
     // Analyze the output buffers
-    std::vector<Type> out_types;
-    if (root_call->checked_type()->IsInstance<TupleTypeNode>()) {
-      auto type_node = root_call->checked_type().as<TupleTypeNode>();
-      for (auto field : type_node->fields) {
-        ICHECK(field->IsInstance<TensorTypeNode>());
-        out_types.push_back(field);
-      }
-    } else if (root_call->checked_type()->IsInstance<TensorTypeNode>()) {
-      ICHECK(root_call->checked_type()->IsInstance<TensorTypeNode>());
-      out_types.push_back(root_call->checked_type());
+    auto struct_info = GetStructInfo(GetRef<Call>(root_call));
+
+    std::vector<std::string> out_types;
+    if (const auto* tensor_sinfo = struct_info.as<TensorStructInfoNode>()) {
+      out_types.emplace_back(backend::DType2String(tensor_sinfo->dtype));
     } else {
-      LOG(FATAL) << "Unrecognized type node: " << AsText(root_call->checked_type(), false);
+      LOG(FATAL) << "Unimplemented";
     }
+
     GenerateBodyOutput ret;
     for (const auto& out_type : out_types) {
       const std::string out = "out" + std::to_string(buf_idx_++);
       decl_stream << ", " << out;
       Output output;
       output.name = out;
-      output.dtype = GetDtypeString(out_type.as<TensorTypeNode>());
+      output.dtype = out_type;
       output.need_copy = false;
       ret.outputs.push_back(output);
     }
@@ -770,14 +719,227 @@ class CodegenCutlass : public backend::MemoizedExprTranslator<std::vector<Output
       ret.decl = DenseOp(ext_func_id_, attribute_args, func_args);
     } else if (func_name == "cutlass_batch_matmul") {
       ret.decl = BatchMatmulOp(ext_func_id_, attribute_args, func_args);
-    } else if (IsConv2dResidualBlock(func_name)) {
-      ret.decl = Conv2dOp(ext_func_id_, attribute_args, func_args, true);
     } else if (func_name.find("conv2d") != std::string::npos) {
       ret.decl = Conv2dOp(ext_func_id_, attribute_args, func_args);
     }
-
     return ret;
   }
+
+  /*! \brief Print indents using spaces. */
+  void PrintIndents() {
+    for (int i = 0; i < indent_; i++) {
+      code_stream_ << ' ';
+    }
+  }
+
+  /*!
+   * \brief Enter a new scope.
+   */
+  void EnterScope() { indent_ += 2; }
+
+  /*!
+   * \brief Exit a scope.
+   */
+  void ExitScope() {
+    ICHECK_GE(indent_, 2U) << "Wrong ident found.";
+    indent_ -= 2;
+  }
+
+  /*!
+   * \brief Creates a runtime function header
+   */
+  void PrintRuntimeFunctionHeader(std::string func_name) {
+    code_stream_ << "#ifdef __cplusplus\n";
+    code_stream_ << "extern \"C\" {\n";
+    code_stream_ << "#endif\n";
+    code_stream_ << "TVM_DLL int32_t ";
+    code_stream_ << func_name << "(";
+    code_stream_ << "TVMValue* args, ";
+    code_stream_ << "int* type_code, ";
+    code_stream_ << "int num_args, ";
+    code_stream_ << "TVMValue* out_value, ";
+    code_stream_ << "int* out_type_code) {\n";
+  }
+
+  /*!
+   * \brief Adds a line to convert TVMValue args to DLTensors
+   */
+  void PrintArgToData(int idx) {
+    PrintIndents();
+    code_stream_ << "DLTensor* arg" << idx << " = ";
+    code_stream_ << "(DLTensor*)(((TVMValue*)args)[" << idx << "].v_handle);\n";
+  }
+
+  /*!
+   * \brief Adds a line to convert TVMValue rets to DLTensors
+   */
+  void PrintRetToData(int idx) {
+    PrintIndents();
+    code_stream_ << "DLTensor* ret" << idx << " = ";
+    code_stream_ << "(DLTensor*)(((TVMValue*)args)[" << idx << "].v_handle);\n";
+  }
+
+  /*!
+   * \brief Gerenate C code for the external function.
+   *
+   * \param func_name The name of the external function.
+   * \param args arguments to the external function.
+   *
+   * \code
+   *
+   * Array<NDArray> foo_consts;
+   *
+   * // An example code for the generated C function.
+   * int foo_wrapper_(DLTensor* arg0,
+   *                              DLTensor* arg1,
+   *                              DLTensor* out) {
+   *   foo_((float*)(arg0->data),
+   *        (float*)(arg1->data),
+   *        (float*)(out->data));
+   *   return 0;
+   * }
+   *
+   * TVM_DLL_EXPORT_TYPED_FUNC(foo, foo_wrapper_);
+   *
+   * int foo_init_wrapper_(Array<NDArray> arr) {
+   *   foo_consts = arr;
+   *   return 0;
+   * }
+   *
+   * TVM_DLL_EXPORT_TYPED_FUNC(__init_foo, foo_init_wrapper_);
+   *
+   * \endcode
+   */
+  void GenerateBackendCFunc(const std::string& func_name, const Array<Var>& args,
+                            const std::string& const_arr_name, const std::vector<Output>& outs,
+                            bool pass_dl_tensor = false) {
+    // Print signature
+    code_stream_ << "\n";
+
+    code_stream_ << "int " << func_name << "_wrapper_(";
+    for (size_t i = 0; i < args.size(); i++) {
+      code_stream_ << "DLTensor* arg" << i << ",\n";
+      code_stream_ << "\t";
+    }
+    for (size_t i = 0; i < outs.size() - 1; i++) {
+      code_stream_ << "DLTensor* out" << i << ",\n";
+      code_stream_ << "\t";
+    }
+    code_stream_ << "DLTensor* out" << outs.size() - 1 << ") {\n";
+
+    EnterScope();
+
+    // Generate the internal call.
+    PrintIndents();
+    code_stream_ << func_name << "_(";
+    for (size_t i = 0; i < args.size(); i++) {
+      if (pass_dl_tensor) {
+        code_stream_ << "arg" << i << ",\n";
+      } else {
+        const auto& dtype_str = GetDtypeString(args[i]);
+        code_stream_ << "(" << dtype_str << "*)(arg" << i << "->data),\n";
+      }
+      PrintIndents();
+    }
+    for (size_t i = 0; i < outs.size() - 1; i++) {
+      if (pass_dl_tensor) {
+        code_stream_ << "out" << i << ",\n";
+      } else {
+        code_stream_ << "(" << outs[i].dtype << "*)(out" << i << "->data),\n";
+      }
+      PrintIndents();
+    }
+    if (pass_dl_tensor) {
+      code_stream_ << "out" << outs.size() - 1 << ");\n";
+    } else {
+      code_stream_ << "(" << outs.back().dtype << "*)(out" << outs.size() - 1 << "->data));\n";
+    }
+    PrintIndents();
+    code_stream_ << "return 0;\n";
+    ExitScope();
+    code_stream_ << "}\n\n";
+
+    // Create the external function
+    PrintRuntimeFunctionHeader(func_name);
+    EnterScope();
+    for (size_t i = 0; i < args.size(); i++) {
+      PrintArgToData(i);
+    }
+    for (size_t i = 0; i < outs.size(); i++) {
+      PrintRetToData(args.size() + i);
+    }
+    PrintIndents();
+    code_stream_ << func_name << "_wrapper_(";
+    for (size_t i = 0; i < args.size(); i++) {
+      code_stream_ << "arg" << i << ",";
+    }
+    for (size_t i = 0; i < outs.size() - 1; i++) {
+      code_stream_ << "ret" << args.size() + i << ",";
+    }
+    code_stream_ << "ret" << args.size() + outs.size() - 1 << ");\n";
+    PrintIndents();
+    code_stream_ << "return 0;\n";
+    ExitScope();
+    code_stream_ << "}\n";
+    code_stream_ << "#ifdef __cplusplus\n";
+    code_stream_ << "}\n";
+    code_stream_ << "#endif\n";
+
+    if (!const_arr_name.empty()) {
+      // If there are constants, insert the __init_ and the wrapper
+      // This segment would be generated in C++ because of the usage
+      // of tvm::runtime::Array. This is not ideal, but this to demonstrate
+      // constant copying process used packed imports in other external
+      // codegen. Moreover, in microTVM we dont expect this part to be generated.
+      code_stream_ << "#ifdef __cplusplus\n";
+      code_stream_ << "int " << func_name
+                   << "_init_wrapper_(tvm::runtime::Array<tvm::runtime::NDArray> arr) {\n";
+      EnterScope();
+      PrintIndents();
+      code_stream_ << func_name << "_consts = arr;\n";
+      code_stream_ << "return 0;\n";
+      ExitScope();
+      code_stream_ << "}\n\n";
+      code_stream_ << "TVM_DLL_EXPORT_TYPED_FUNC(__init_" << func_name << ", " << func_name
+                   << "_init_wrapper_);\n\n";
+      code_stream_ << "#endif\n";
+    }
+  }
+
+  std::string GetDtypeString(const Var& var) {
+    auto ttype = var->checked_type().as<TensorTypeNode>();
+    ICHECK(ttype) << "Expect TensorTypeNode";
+    return GetDtypeString(ttype);
+  }
+
+  /*!
+   * \brief Returns dtype string
+   *
+   * \param ttype TensorTypeNode* to get the dtype of
+   *
+   * \return The dtype string.
+   */
+  std::string GetDtypeString(const TensorTypeNode* ttype) {
+    std::string dtype;
+    if (runtime::TypeMatch(ttype->dtype, kDLFloat, 32)) {
+      dtype = "float";
+    } else if (runtime::TypeMatch(ttype->dtype, kDLFloat, 16)) {
+      dtype = "half";
+    } else if (runtime::TypeMatch(ttype->dtype, kDLBfloat, 16)) {
+      dtype = "bfloat";
+    } else if (runtime::TypeMatch(ttype->dtype, kDLInt, 32)) {
+      dtype = "int";
+    } else if (runtime::TypeMatch(ttype->dtype, kDLInt, 64)) {
+      dtype = "int64_t";
+    } else {
+      LOG(FATAL) << "Unsupported dtype " << ttype->dtype;
+    }
+
+    return dtype;
+  }
+
+  /*! \brief Indent of the source code. */
+  int indent_{0};
   /*! \brief The id of the external cutlass ext_func. */
   std::string ext_func_id_;
   /*! \brief The attrs of the external cutlass ext_func. */
@@ -793,19 +955,15 @@ class CodegenCutlass : public backend::MemoizedExprTranslator<std::vector<Output
   std::vector<std::string> ext_func_body_;
   /*! \brief The declaration of intermediate buffers. */
   std::vector<std::string> buf_decl_;
-};  // class CodegenCutlass
+
+  Map<Var, Expr> bindings_;
+};
 
 class CutlassModuleCodegen {
  public:
-  explicit CutlassModuleCodegen(IRModule mod) : mod_(std::move(mod)) {}
-
-  runtime::Module CreateCSourceModule() {
+  runtime::Module CreateCSourceModule(Function f) {
     EmitPreamble();
-    for (const auto& [_, f] : mod_->functions) {
-      if (const auto* function_node = GetCutlassFunctionNode(f)) {
-        GenCutlassFunc(GetRef<Function>(function_node));
-      }
-    }
+    GenCutlassFunc(f);
     return Finalize();
   }
 
@@ -859,7 +1017,7 @@ class CutlassModuleCodegen {
     const auto* attrs = function->attrs.as<DictAttrsNode>();
     ICHECK(attrs != nullptr);
     const auto dict = attrs->dict;
-    CodegenCutlass builder(sid, dict);
+    CodegenCutlass builder(sid, dict, function);
     VLOG(1) << "Creating cutlass C code for '" << sid << "' from:\n" << PrettyPrint(function);
     auto out = builder.VisitExpr(function->body);
     code_stream_ << builder.JIT(out);
@@ -880,7 +1038,7 @@ class CutlassModuleCodegen {
    */
   static const FunctionNode* GetCutlassFunctionNode(const Expr& expr) {
     if (const auto* function_node = expr.as<FunctionNode>()) {
-      Optional<String> opt_compiler = function_node->GetAttr<String>(attr::kCompiler);
+      Optional<String> opt_compiler = function_node->GetAttr<String>(attr::kCodegen);
       if (opt_compiler.defined() && opt_compiler.value() == "cutlass") {
         return function_node;
       }
@@ -888,8 +1046,6 @@ class CutlassModuleCodegen {
     return nullptr;
   }
 
-  /*! \brief Module we are compiling. */
-  IRModule mod_;
   /*! \brief The accumulated code stream that will be compiled by NVCC */
   std::ostringstream code_stream_;
   /*! \brief The accumulated function names. */
@@ -897,40 +1053,22 @@ class CutlassModuleCodegen {
 };  // CutlassModuleCodegen
 
 /*!
- * \brief A small shim to redirect to the 'relay.ext.cutlass.compile_for_cutlass' Python
- * function which does the main CUTLASS training, c-code generation and compilation steps.
+ * \brief Create a runtime module for CUTLASS.
+ * \param ref The ext_func Relay expression/module to be executed using extern ops.
+ * \return A runtime module.
  */
-tvm::transform::Pass CompileForCutlassImpl() {
-  auto pass_func = [=](IRModule mod, const tvm::transform::PassContext& pass_ctx) {
-    VLOG(1) << "CompileForCutlass input:" << std::endl << PrettyPrint(mod);
-    const auto* pf = runtime::Registry::Get("relay.ext.cutlass.compile_for_cutlass");
-    ICHECK(pf != nullptr) << "Cannot find compile_for_cutlass function";
-    Target target = GetCutlassTarget();
-    runtime::Module runtime_mod = (*pf)(mod, target);
-    Array<runtime::Module> external_mods =
-        mod->GetAttr<Array<runtime::Module>>(tvm::attr::kExternalMods).value_or({});
-    external_mods.push_back(runtime_mod);
-    return WithAttr(mod, tvm::attr::kExternalMods, external_mods);
-  };
-  return tvm::transform::CreateModulePass(pass_func, 0, "CompileForCutlass", {});
+runtime::Module CUTLASSCompiler(const ObjectRef& ref) {
+  ICHECK(ref->IsInstance<FunctionNode>()) << "The input ref is expected to be a Relax function.";
+  Function func = Downcast<Function>(ref);
+  std::string func_name = backend::GetExtSymbol(func);
+  auto source_mod = CutlassModuleCodegen().CreateCSourceModule(func);
+  const auto* pf = runtime::Registry::Get("contrib.cutlass.compile");
+  ICHECK(pf != nullptr);
+  return (*pf)(source_mod);
 }
 
-runtime::Module CreateCSourceModule(const IRModule& mod) {
-  VLOG(1) << "Creating CUTLASS CSource module from:" << std::endl << PrettyPrint(mod);
-  return CutlassModuleCodegen(mod).CreateCSourceModule();
-}
+TVM_REGISTER_GLOBAL("relax.ext.cutlass").set_body_typed(CUTLASSCompiler);
 
-}  // namespace
-
-TVM_REGISTER_GLOBAL("relay.ext.cutlass.create_c_source_module").set_body_typed(CreateCSourceModule);
-
-tvm::transform::Pass CompileForCutlass() {
-  return transform::Sequential(
-      {transform::OutlineCompilerFunctionsWithExistingGlobalSymbols("cutlass"),
-       CompileForCutlassImpl(), transform::MarkCompilerFunctionsAsExtern("cutlass")});
-}
-
-}  // namespace cutlass
 }  // namespace contrib
-}  // namespace relay
+}  // namespace relax
 }  // namespace tvm
