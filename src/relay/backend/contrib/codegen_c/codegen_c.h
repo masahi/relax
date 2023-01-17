@@ -50,6 +50,45 @@ struct GenerateBodyOutput {
   std::vector<Output> outputs;
 };
 
+/*!
+ * \brief Returns dtype string
+ *
+ * \param ttype TensorTypeNode* to get the dtype of
+ *
+ * \return The dtype string.
+ */
+inline std::string GetDtypeString(const TensorTypeNode* ttype) {
+  std::string dtype;
+  if (runtime::TypeMatch(ttype->dtype, kDLFloat, 32)) {
+    dtype = "float";
+  } else if (runtime::TypeMatch(ttype->dtype, kDLFloat, 16)) {
+    dtype = "half";
+  } else if (runtime::TypeMatch(ttype->dtype, kDLBfloat, 16)) {
+    dtype = "bfloat";
+  } else if (runtime::TypeMatch(ttype->dtype, kDLInt, 32)) {
+    dtype = "int";
+  } else if (runtime::TypeMatch(ttype->dtype, kDLInt, 64)) {
+    dtype = "int64_t";
+  } else {
+    LOG(FATAL) << "Unsupported dtype " << ttype->dtype;
+  }
+
+  return dtype;
+}
+
+/*!
+ * \brief Returns dtype string
+ *
+ * \param var Var to get the dtype of
+ *
+ * \return The dtype string.
+ */
+inline std::string GetDtypeString(const Var& var) {
+  auto ttype = var->checked_type().as<TensorTypeNode>();
+  ICHECK(ttype) << "Expect TensorTypeNode";
+  return GetDtypeString(ttype);
+}
+
 class CSourceModuleCodegenBase {
  public:
   CSourceModuleCodegenBase() = default;
@@ -159,14 +198,14 @@ class CodegenCBase {
    *
    * \endcode
    */
-  void GenerateBackendCFunc(const std::string& func_name, const Array<Var>& args,
+  void GenerateBackendCFunc(const std::string& func_name, const std::vector<std::string>& arg_types,
                             const std::string& const_arr_name, const std::vector<Output>& outs,
                             bool pass_dl_tensor = false) {
     // Print signature
     code_stream_ << "\n";
 
     code_stream_ << "int " << func_name << "_wrapper_(";
-    for (size_t i = 0; i < args.size(); i++) {
+    for (size_t i = 0; i < arg_types.size(); i++) {
       code_stream_ << "DLTensor* arg" << i << ",\n";
       code_stream_ << "\t";
     }
@@ -181,12 +220,11 @@ class CodegenCBase {
     // Generate the internal call.
     PrintIndents();
     code_stream_ << func_name << "_(";
-    for (size_t i = 0; i < args.size(); i++) {
+    for (size_t i = 0; i < arg_types.size(); i++) {
       if (pass_dl_tensor) {
         code_stream_ << "arg" << i << ",\n";
       } else {
-        const auto& dtype_str = GetDtypeString(args[i]);
-        code_stream_ << "(" << dtype_str << "*)(arg" << i << "->data),\n";
+        code_stream_ << "(" << arg_types[i] << "*)(arg" << i << "->data),\n";
       }
       PrintIndents();
     }
@@ -211,21 +249,21 @@ class CodegenCBase {
     // Create the external function
     PrintRuntimeFunctionHeader(func_name);
     EnterScope();
-    for (size_t i = 0; i < args.size(); i++) {
+    for (size_t i = 0; i < arg_types.size(); i++) {
       PrintArgToData(i);
     }
     for (size_t i = 0; i < outs.size(); i++) {
-      PrintRetToData(args.size() + i);
+      PrintRetToData(arg_types.size() + i);
     }
     PrintIndents();
     code_stream_ << func_name << "_wrapper_(";
-    for (size_t i = 0; i < args.size(); i++) {
+    for (size_t i = 0; i < arg_types.size(); i++) {
       code_stream_ << "arg" << i << ",";
     }
     for (size_t i = 0; i < outs.size() - 1; i++) {
-      code_stream_ << "ret" << args.size() + i << ",";
+      code_stream_ << "ret" << arg_types.size() + i << ",";
     }
-    code_stream_ << "ret" << args.size() + outs.size() - 1 << ");\n";
+    code_stream_ << "ret" << arg_types.size() + outs.size() - 1 << ");\n";
     PrintIndents();
     code_stream_ << "return 0;\n";
     ExitScope();
@@ -253,6 +291,16 @@ class CodegenCBase {
                    << "_init_wrapper_);\n\n";
       code_stream_ << "#endif\n";
     }
+  }
+
+  void GenerateBackendCFunc(const std::string& func_name, const Array<Var>& args,
+                            const std::string& const_arr_name, const std::vector<Output>& outs,
+                            bool pass_dl_tensor = false) {
+    std::vector<std::string> arg_types;
+    for (size_t i = 0; i < args.size(); i++) {
+      arg_types.push_back(GetDtypeString(args[i]));
+    }
+    return GenerateBackendCFunc(func_name, arg_types, const_arr_name, outs, pass_dl_tensor);
   }
 
   /*!
@@ -335,45 +383,6 @@ class CodegenCBase {
     // Create the wrapper to call the ext_func
     this->GenerateBackendCFunc(ext_func_id, args, const_arr_name, outs);
     return code_stream_.str();
-  }
-
-  /*!
-   * \brief Returns dtype string
-   *
-   * \param var Var to get the dtype of
-   *
-   * \return The dtype string.
-   */
-  std::string GetDtypeString(const Var& var) {
-    auto ttype = var->checked_type().as<TensorTypeNode>();
-    ICHECK(ttype) << "Expect TensorTypeNode";
-    return GetDtypeString(ttype);
-  }
-
-  /*!
-   * \brief Returns dtype string
-   *
-   * \param ttype TensorTypeNode* to get the dtype of
-   *
-   * \return The dtype string.
-   */
-  std::string GetDtypeString(const TensorTypeNode* ttype) {
-    std::string dtype;
-    if (runtime::TypeMatch(ttype->dtype, kDLFloat, 32)) {
-      dtype = "float";
-    } else if (runtime::TypeMatch(ttype->dtype, kDLFloat, 16)) {
-      dtype = "half";
-    } else if (runtime::TypeMatch(ttype->dtype, kDLBfloat, 16)) {
-      dtype = "bfloat";
-    } else if (runtime::TypeMatch(ttype->dtype, kDLInt, 32)) {
-      dtype = "int";
-    } else if (runtime::TypeMatch(ttype->dtype, kDLInt, 64)) {
-      dtype = "int64_t";
-    } else {
-      LOG(FATAL) << "Unsupported dtype " << ttype->dtype;
-    }
-
-    return dtype;
   }
 
   /*!

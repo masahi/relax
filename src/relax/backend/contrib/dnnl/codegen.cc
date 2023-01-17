@@ -41,13 +41,6 @@ using JSONGraphNode = tvm::runtime::json::JSONGraphNode;
 using JSONGraphNodeEntry = tvm::runtime::json::JSONGraphNodeEntry;
 using JSONSerializer = backend::contrib::JSONSerializer;
 
-inline bool IsOp(const CallNode* call, const std::string& op_name) {
-  const auto* op_node = call->op.as<OpNode>();
-  if (!op_node) return false;
-  Op op = GetRef<Op>(op_node);
-  return op == Op::Get(op_name);
-}
-
 /*!
  * \brief Generates an DNNLModule from a relax expression by serializing the expression to a
  * json representation. DNNL is not required here because use of DNNL APIs is deferred until
@@ -75,7 +68,7 @@ class DNNLJSONSerializer : public JSONSerializer {
     const CallNode* root_call = call_node;
     if (name.find("conv2d") != std::string::npos) {
       for (auto [var, val] : bindings_) {
-        if (val->IsInstance<CallNode>() && IsOp(val.as<CallNode>(), "relax.nn.conv2d")) {
+        if (val->IsInstance<CallNode>() && backend::IsOp(val.as<CallNode>(), "relax.nn.conv2d")) {
           root_call = val.as<CallNode>();
           break;
         }
