@@ -784,18 +784,14 @@ class PatternBasedPartitioner : ExprVisitor {
   using Group = GraphPartitioner::Group;
   using ExprVisitor::VisitExpr_;
 
-  static std::unordered_map<const Object*, Group*> Run(
-      const tvm::Array<runtime::String>& pattern_names, const tvm::Array<DFPattern>& patterns,
-      Expr expr, support::Arena* arena) {
-    std::unordered_map<const Object*, Group*> group_map;
-    for (size_t i = 0; i < patterns.size(); ++i) {
-      PatternBasedPartitioner part(pattern_names[i], patterns[i], AnalyzeVar2Value(expr));
-      PostOrderVisit(
-          expr, [arena, &part](const Expr& e) { part.group_map_[e.get()] = arena->make<Group>(); });
-      part.VisitExpr(expr);
-      group_map.insert(part.group_map_.begin(), part.group_map_.end());
-    }
-    return group_map;
+  static std::unordered_map<const Object*, Group*> Run(runtime::String pattern_name,
+                                                       DFPattern pattern, Expr expr,
+                                                       support::Arena* arena) {
+    PatternBasedPartitioner part(pattern_name, pattern, AnalyzeVar2Value(expr));
+    PostOrderVisit(
+        expr, [arena, &part](const Expr& e) { part.group_map_[e.get()] = arena->make<Group>(); });
+    part.VisitExpr(expr);
+    return part.group_map_;
   }
 
   PatternBasedPartitioner(const std::string& pattern_name, DFPattern pattern,
@@ -858,13 +854,16 @@ class PatternBasedPartitioner : ExprVisitor {
 
 IRModule FuseOpsByPattern(const tvm::Array<runtime::String>& pattern_names,
                           const tvm::Array<DFPattern>& patterns, IRModule mod) {
-  std::unordered_map<const Object*, PatternBasedPartitioner::Group*> group_map;
   support::Arena arena;
-  for (const auto& [gv, func] : mod->functions) {
-    auto map = PatternBasedPartitioner::Run(pattern_names, patterns, func, &arena);
-    group_map.insert(map.begin(), map.end());
+  for (size_t i = 0; i < pattern_names.size(); ++i) {
+    std::unordered_map<const Object*, PatternBasedPartitioner::Group*> group_map;
+    for (const auto& [gv, func] : mod->functions) {
+      auto map = PatternBasedPartitioner::Run(pattern_names[i], patterns[i], func, &arena);
+      group_map.insert(map.begin(), map.end());
+    }
+    mod = OperatorFusor(mod, group_map).Transform();
   }
-  return OperatorFusor(mod, group_map).Transform();
+  return mod;
 }
 
 namespace transform {
