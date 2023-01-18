@@ -25,6 +25,7 @@
 
 #include <tvm/relax/analysis.h>
 #include <tvm/relax/expr_functor.h>
+#include <tvm/relax/utils.h>
 
 #include <iostream>
 
@@ -56,7 +57,7 @@ class CodeGenRunner : ExprMutator {
       out_mod = WithAttr(out_mod, "external_mods", std::move(ext_mods_));
     }
 
-    return out_mod;
+    return RemoveUnusedFunctions(out_mod, {"main"});
   }
 
   using ExprMutator::VisitExpr_;

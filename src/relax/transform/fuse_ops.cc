@@ -845,7 +845,7 @@ class PatternBasedPartitioner : ExprVisitor {
     return group_map_[bound_var.get()];
   }
 
-  const std::string& pat_name_;
+  std::string pat_name_;
   DFPattern pat_;
   Map<Var, Expr> bindings_;
   Map<Expr, Var> value_to_bound_var_;

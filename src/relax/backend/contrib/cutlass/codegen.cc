@@ -190,7 +190,7 @@ class CodegenCutlass : public tvm::relax::backend::MemoizedExprTranslator<std::v
     const auto pattern_name = callee->GetAttr<runtime::String>(attr::kComposite);
     ICHECK(pattern_name.defined()) << "Only functions with composite attribute are supported.";
 
-    if (pattern_name == "conv2d_bias_relu") {
+    if (pattern_name == "cutlass.conv2d_bias_relu") {
       const CallNode* conv2d_call = caller;
       for (auto [var, val] : bindings_) {
         if (val->IsInstance<CallNode>() && backend::IsOp(val.as<CallNode>(), "relax.nn.conv2d")) {

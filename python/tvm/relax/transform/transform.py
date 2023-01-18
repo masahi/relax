@@ -655,3 +655,8 @@ def dataflowblock_pass(
     if pass_func:
         return create_dataflowblock_pass(pass_func)
     return create_dataflowblock_pass
+
+
+def WrapCompositeFunction() -> tvm.ir.transform.Pass:
+    """TODO"""
+    return _ffi_api.WrapCompositeFunction()  # type: ignore

@@ -1056,3 +1056,20 @@ def _only_used_by(
     if isinstance(rhs, DFPattern):
         rhs = PatternSeq([rhs])
     return ffi.only_used_by(lhs, rhs, index)  # type: ignore
+
+
+def make_conv_pattern(conv_name, with_bias=False, activation=None):
+    data = wildcard()
+    weight = wildcard()
+    conv = is_op(conv_name)(data, weight)
+
+    if with_bias:
+        bias = wildcard()
+        conv_out = is_op("relax.add")(conv, bias)
+    else:
+        conv_out = conv
+
+    if activation:
+        return is_op(activation)(conv_out)
+
+    return conv_out
