@@ -47,8 +47,9 @@ using relay::contrib::cutlass::GenerateBody;
 class CodegenCutlass : public tvm::relax::backend::MemoizedExprTranslator<std::vector<Output>>,
                        public relay::contrib::CodegenCBase {
  public:
-  CodegenCutlass(const std::string& id, const Map<String, ObjectRef>& attrs, const Expr& func_expr)
-      : ext_func_id_(id), attrs_(attrs), bindings_(AnalyzeVar2Value(func_expr)) {}
+  CodegenCutlass(const std::string& id, const Map<String, ObjectRef>& options,
+                 const Map<Var, Expr>& bindings)
+      : ext_func_id_(id), options_(options), bindings_(bindings) {}
 
   std::string JIT(const std::vector<Output>& out) final {
     std::vector<std::string> arg_types, arg_names;
@@ -190,6 +191,12 @@ class CodegenCutlass : public tvm::relax::backend::MemoizedExprTranslator<std::v
     const auto pattern_name = callee->GetAttr<runtime::String>(attr::kComposite);
     ICHECK(pattern_name.defined()) << "Only functions with composite attribute are supported.";
 
+    const auto* pf = runtime::Registry::Get("contrib.cutlass.tune_relax_function");
+    ICHECK(pf != nullptr) << "The packed function contrib.cutlass.tune_relax_function not found, "
+                             "please import tvm.contrib.cutlass.build";
+
+    Map<String, ObjectRef> annotations = (*pf)(callee, options_);
+
     if (pattern_name == "cutlass.conv2d_bias_relu") {
       const CallNode* conv2d_call = caller;
       for (auto [var, val] : bindings_) {
@@ -199,7 +206,7 @@ class CodegenCutlass : public tvm::relax::backend::MemoizedExprTranslator<std::v
         }
       }
       return GenerateBody(conv2d_call, "cutlass_conv2d_bias_relu", GetArgumentNames(caller),
-                          Conv2dArgs(std::ref(attrs_)));
+                          Conv2dArgs(annotations));
     }
 
     LOG(FATAL) << "Unknown composite function: " << pattern_name;
@@ -224,8 +231,6 @@ class CodegenCutlass : public tvm::relax::backend::MemoizedExprTranslator<std::v
 
   /*! \brief The id of the external cutlass ext_func. */
   std::string ext_func_id_;
-  /*! \brief The attrs of the external cutlass ext_func. */
-  Map<String, ObjectRef> attrs_;
   /*!
    * \brief The index to track the output buffer. Each kernel will redirect the
    * output to a buffer that may be consumed by other kernels.
@@ -237,19 +242,19 @@ class CodegenCutlass : public tvm::relax::backend::MemoizedExprTranslator<std::v
   std::vector<std::string> ext_func_body_;
   /*! \brief The declaration of intermediate buffers. */
   std::vector<std::string> buf_decl_;
-
+  Map<String, ObjectRef> options_;
   Map<Var, Expr> bindings_;
 };
 
 class CutlassModuleCodegen {
  public:
-  runtime::Module CreateCSourceModule(Function f) {
-    auto code = EmitHeaders() + GenCutlassFunc(f);
+  runtime::Module CreateCSourceModule(Function f, const Map<String, ObjectRef>& options) {
+    auto code = EmitHeaders() + GenCutlassFunc(f, options);
     return Finalize(code, func_names_);
   }
 
  private:
-  std::string GenCutlassFunc(const Function& function) {
+  std::string GenCutlassFunc(const Function& function, const Map<String, ObjectRef>& options) {
     ICHECK(function.defined()) << "Input error: expect a Relay function.";
 
     // Record the external symbol for runtime lookup.
@@ -259,16 +264,13 @@ class CutlassModuleCodegen {
     std::string sid = opt_global_symbol.value();
     func_names_.push_back(sid);
 
-    const auto* attrs = function->attrs.as<DictAttrsNode>();
-    ICHECK(attrs != nullptr);
-    CodegenCutlass builder(sid, attrs->dict, function);
+    CodegenCutlass builder(sid, options, AnalyzeVar2Value(function));
     auto out = builder.VisitExpr(function->body);
     return builder.JIT(out);
   }
 
   /*! \brief The accumulated function names. */
   Array<String> func_names_;
-  Map<String, ObjectRef> options_;
 };  // CutlassModuleCodegen
 
 /*!
@@ -280,9 +282,10 @@ runtime::Module CUTLASSCompiler(const ObjectRef& ref, Map<String, ObjectRef> opt
   ICHECK(ref->IsInstance<FunctionNode>()) << "The input ref is expected to be a Relax function.";
   Function func = Downcast<Function>(ref);
   std::string func_name = backend::GetExtSymbol(func);
-  auto source_mod = CutlassModuleCodegen().CreateCSourceModule(func);
+  auto source_mod = CutlassModuleCodegen().CreateCSourceModule(func, options);
   const auto* pf = runtime::Registry::Get("contrib.cutlass.compile");
-  ICHECK(pf != nullptr);
+  ICHECK(pf != nullptr) << "The packed function contrib.cutlass.compile not found, please import "
+                           "tvm.contrib.cutlass.build";
   return (*pf)(source_mod, options);
 }
 

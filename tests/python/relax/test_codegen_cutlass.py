@@ -82,69 +82,6 @@ class Conv2dBiasReLU:
         return conv1
 
 
-def annotate_attributes(mod):
-    # TODO: automate
-    op_name = "cutlass_tensorop_h1688fprop_optimized_256x128_32x2_nhwc_align8"
-
-    op_def = """
-      using cutlass_tensorop_h1688fprop_optimized_256x128_32x2_nhwc_align8 =
-      typename cutlass::conv::kernel::DefaultConv2dFprop<
-        cutlass::half_t,
-        cutlass::layout::TensorNHWC,
-        cutlass::half_t,
-        cutlass::layout::TensorNHWC,
-        cutlass::half_t,
-        cutlass::layout::TensorNHWC,
-        cutlass::half_t,
-        cutlass::arch::OpClassTensorOp,
-        cutlass::arch::Sm75,
-        cutlass::gemm::GemmShape<256, 128, 32>,
-        cutlass::gemm::GemmShape<64, 64, 32 >,
-        cutlass::gemm::GemmShape<16, 8, 8>,
-
-        cutlass::epilogue::thread::LinearCombinationRelu<
-          cutlass::half_t,
-          8,
-          cutlass::half_t,
-          cutlass::half_t,
-          cutlass::epilogue::thread::ScaleType::NoBetaScaling
-        >,
-        cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<4>, // cutlass::gemm::threadblock::GemmSplitKIdentityThreadblockSwizzle<>,
-        2,
-        cutlass::arch::OpMultiplyAdd,
-        cutlass::conv::IteratorAlgorithm::kOptimized,
-        cutlass::conv::StrideSupport::kStrided,
-        8,
-        8
-      >::Kernel;
-    """
-    f_name = "fused_relax_nn_conv2d_relax_add_relax_nn_relu_cutlass"
-    f = mod[f_name]
-
-    for k, v in {
-        "arg0_dtype": "float16",
-        "arg1_dtype": "float16",
-        "ret_dtype": "float32",
-        "arg0_shape": "float16",
-        "arg1_dtype": "float16",
-        "ret_dtype": "float32",
-        "op_type": "conv2d_bias_relu",
-        "arg0_shape": [16, 32, 32, 16],
-        "arg1_shape": [32, 3, 3, 16],
-        "ret_shape": [16, 32, 32, 32],
-        "strides": [1, 1],
-        "padding": [1, 1],
-        "dilation": [1, 1],
-        "cutlass_op_name": op_name,
-        "cutlass_op_def": op_def,
-    }.items():
-        f = f.with_attr(k, v)
-
-    mod[f_name] = f
-
-    return mod
-
-
 def test_conv2d_offload():
     data_np = np.random.randn(16, 32, 32, 16).astype("float16")
     weight_np = np.random.randn(32, 3, 3, 16).astype("float16")
@@ -156,11 +93,11 @@ def test_conv2d_offload():
         [
             relax.transform.FuseOpsByPattern(["cutlass.conv2d_bias_relu"], [pat]),
             relax.transform.WrapCompositeFunction(),
+            relax.transform.RunCodegen(["cutlass"], [{"sm": 80, "find_first_valid": True}]),
         ]
     )
 
-    mod = annotate_attributes(seq(Conv2dBiasReLU))
-    mod = relax.transform.RunCodegen(["cutlass"], [{"sm": 80}])(mod)
+    mod = seq(Conv2dBiasReLU)
 
     target = tvm.target.Target("cuda")
     ex = relax.vm.build(mod, target)

@@ -516,6 +516,64 @@ def tune_cutlass_function(
     )
 
 
+@register_func("contrib.cutlass.tune_relax_function")
+def profile_relax_function(f, options):
+    tmp_dir = options.get("tmp_dir", "./tmp")
+    sm = options.get("sm", 80)
+    use_3xtf32 = options.get("use_3xtf32", False)
+    profile_all_alignments = options.get("profile_all_alignments", False)
+    find_first_valid = options.get("find_first_valid", True)
+    use_multiprocessing = options.get("use_multiprocessing", True)
+
+    conv2d_profiler = CutlassConv2DProfiler(sm, _get_cutlass_path(), tmp_dir)
+
+    op_type = f.attrs["Composite"]
+    d_shape = [16, 32, 32, 16]
+    w_shape = [32, 3, 3, 16]
+    padding = [1, 1]
+    strides = [1, 1]
+    dilation = [1, 1]
+    out_dtype = "float16"
+    data_dtype = "float16"
+    weight_dtype = "float16"
+    conv_kind = ConvKind.Fprop
+    split_k_slices = [1]
+
+    op_name, op_def, _ = conv2d_profiler.profile(op_type,
+            d_shape,
+            w_shape,
+            padding,
+            strides,
+            dilation,
+            out_dtype,
+            data_dtype,
+            weight_dtype,
+            use_3xtf32,
+            conv_kind,
+            split_k_slices,
+            profile_all_alignments,
+            find_first_valid=find_first_valid,
+            use_multiprocessing=use_multiprocessing,
+        )
+
+    return {
+        "arg0_dtype": "float16",
+        "arg1_dtype": "float16",
+        "ret_dtype": "float16",
+        "arg0_shape": "float16",
+        "arg1_dtype": "float16",
+        "op_type": "conv2d_bias_relu",
+        "arg0_shape": [16, 32, 32, 16],
+        "arg1_shape": [32, 3, 3, 16],
+        "ret_shape": [16, 32, 32, 32],
+        "strides": [1, 1],
+        "padding": [1, 1],
+        "dilation": [1, 1],
+        "cutlass_op_name": op_name,
+        "cutlass_op_def": op_def,
+    }
+
+
 @register_func("contrib.cutlass.compile")
 def compile_cutlass_module(c_source_module, options):
     tmp_dir = options.get("tmp_dir", "./tmp")
