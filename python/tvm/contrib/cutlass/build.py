@@ -517,10 +517,12 @@ def tune_cutlass_function(
 
 
 @register_func("contrib.cutlass.compile")
-def compile_cutlass_module(c_source_module):
-    # TODO: Pass them as param
-    tmp_dir = "tmp"
-    compile_config = {"sm": 80, "threads": -1, "use_fast_math": False}
+def compile_cutlass_module(c_source_module, options):
+    tmp_dir = options.get("tmp_dir", "./tmp")
+    defaults = {"sm": 80, "threads": -1, "use_fast_math": False}
+    compile_config = {
+        key: options.get(key, defaults[key]) for key in defaults.keys()
+    }
 
     function_names = c_source_module.get_function("get_func_names")()
     compile_options = _get_cutlass_compile_options(**compile_config)
@@ -565,6 +567,7 @@ def compile_for_cutlass(mod, cutlass_target):
         key: cutlass_target.attrs.get(key) for key in ["sm", "threads", "use_fast_math"]
     }
     tmp_dir = cutlass_target.attrs.get("tmp_dir")
+    compile_config["tmp_dir"] = tmp_dir
 
     # Tune
     logger.info("Tuning for CUTLASS")
@@ -574,20 +577,7 @@ def compile_for_cutlass(mod, cutlass_target):
     logger.info("Creating CSource module for CUTLASS")
     create_c_source_module = tvm._ffi.get_global_func("relay.ext.cutlass.create_c_source_module")
     c_module = create_c_source_module(mod)
-
-    # TODO: use compile_cutlass_module above
-    function_names = c_module.get_function("get_func_names")()
-    compile_options = _get_cutlass_compile_options(**compile_config)
-    lib_path = os.path.join(tmp_dir, "cutlass.o")
-    logger.info("Compiling generated CUTLASS code")
-    c_module.export_library(lib_path, workspace_dir=tmp_dir, **compile_options)
-
-    # Recover static library
-    logger.info("Loading compiled CUTLASS code")
-    final_mod = tvm.runtime.load_static_library(lib_path, function_names)
-
-    logger.info("Done with CUTLASS compilation")
-    return final_mod
+    return compile_cutlass_module(c_module, compile_config)
 
 
 def finalize_modules(lib, lib_path="compile.so", tmp_dir="./tmp"):

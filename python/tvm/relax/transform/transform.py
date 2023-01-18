@@ -224,7 +224,9 @@ def RemoveUnusedFunctions(entry_functions: Optional[List[str]] = None) -> tvm.ir
 
 
 def RunCodegen(
-    target_codegens: Optional[List[str]] = None, entry_functions: Optional[List[str]] = None
+    target_codegens: Optional[List[str]] = None,
+    target_options: Optional[List[dict]] = None,
+    entry_functions: Optional[List[str]] = None
 ) -> tvm.ir.transform.Pass:
     """Produce the runtime::Module with an annotated codegen and global symbol.
 
@@ -232,6 +234,8 @@ def RunCodegen(
     ----------
     target_codegens: Optional[List[str]]
         List of target codegens. If empty, perform all codegens by default.
+    target_options: Optional[List[dict]]
+        List of compilation options for each target.
     entry_functions: Optional[List[str]]
         The set of entry functions to start from.
 
@@ -242,7 +246,7 @@ def RunCodegen(
     """
     if entry_functions is None:
         entry_functions = ["main"]
-    return _ffi_api.RunCodegen(target_codegens, entry_functions)  # type: ignore
+    return _ffi_api.RunCodegen(target_codegens, target_options, entry_functions)  # type: ignore
 
 
 def FoldConstant() -> tvm.ir.transform.Pass:

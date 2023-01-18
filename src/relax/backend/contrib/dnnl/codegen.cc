@@ -99,7 +99,7 @@ class DNNLJSONSerializer : public JSONSerializer {
  * \param ref The ext_func Relay expression/module to be executed using extern ops.
  * \return A runtime module.
  */
-runtime::Module DNNLCompiler(const ObjectRef& ref) {
+runtime::Module DNNLCompiler(const ObjectRef& ref, Map<String, ObjectRef>/*unused*/) {
   ICHECK(ref->IsInstance<FunctionNode>()) << "The input ref is expected to be a Relax function.";
   Function func = Downcast<Function>(ref);
   std::string func_name = backend::GetExtSymbol(func);

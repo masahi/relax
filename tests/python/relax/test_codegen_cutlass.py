@@ -160,7 +160,7 @@ def test_conv2d_offload():
     )
 
     mod = annotate_attributes(seq(Conv2dBiasReLU))
-    mod = relax.transform.RunCodegen()(mod)
+    mod = relax.transform.RunCodegen(["cutlass"], [{"sm": 80}])(mod)
 
     target = tvm.target.Target("cuda")
     ex = relax.vm.build(mod, target)

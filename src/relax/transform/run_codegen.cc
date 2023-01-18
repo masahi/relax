@@ -28,6 +28,7 @@
 #include <tvm/relax/utils.h>
 
 #include <iostream>
+#include "tvm/runtime/object.h"
 
 namespace tvm {
 namespace relax {
@@ -35,11 +36,17 @@ namespace relax {
 class CodeGenRunner : ExprMutator {
  public:
   explicit CodeGenRunner(IRModule mod, Optional<Array<runtime::String>> target_codegens,
+			 Optional<Array<Map<String, ObjectRef>>> target_options,
                          Array<runtime::String> entry_functions)
       : ExprMutator(mod), entry_functions_(std::move(entry_functions)) {
-    if (target_codegens.defined()) {
-      for (auto target : target_codegens.value()) {
-        target_codegens_.insert(target);
+    if (target_codegens) {
+      for (size_t i = 0; i < target_codegens.value().size(); ++i) {
+	std::string target = target_codegens.value()[i];
+	if (target_options) {
+	  target_codegens_[target] = target_options.value()[i];
+	} else {
+	  target_codegens_[target] = {};
+	}
       }
     }
   }
@@ -109,8 +116,13 @@ class CodeGenRunner : ExprMutator {
 
       String codegen_str = opt_codegen.value();
       // If the current codegen is not in the provided target lists, defer the codegen process.
-      if (target_codegens_.size() && target_codegens_.count(codegen_str) == 0) {
+      if (!target_codegens_.empty() && target_codegens_.count(codegen_str) == 0) {
         return GetRef<Function>(func_node);
+      }
+
+      Map<String, ObjectRef> options;
+      if (auto it = target_codegens_.find(codegen_str); it != target_codegens_.end()) {
+	options = it->second;
       }
 
       // Start the codegen process.
@@ -119,7 +131,7 @@ class CodeGenRunner : ExprMutator {
       auto codegen = runtime::Registry::Get(codegen_name);
       ICHECK(codegen) << "Codegen is not found: " << codegen_name << "\n";
       // Store the produced output runtime module in the internal array.
-      ext_mods_.push_back((*codegen)(func));
+      ext_mods_.push_back((*codegen)(func, options));
 
       // Return the external function with given global symbol.
       return ExternFunc(opt_gsymbol.value());
@@ -130,7 +142,7 @@ class CodeGenRunner : ExprMutator {
 
  private:
   Array<runtime::String> entry_functions_;
-  std::unordered_set<std::string> target_codegens_;
+  std::unordered_map<std::string, Map<String, ObjectRef>> target_codegens_;
   Array<runtime::Module> ext_mods_;
 };
 
@@ -138,10 +150,11 @@ class CodeGenRunner : ExprMutator {
 
 namespace transform {
 Pass RunCodegen(Optional<Array<runtime::String>> target_codegens,
+		Optional<Array<Map<String, ObjectRef>>> target_options,
                 Array<runtime::String> entry_functions) {
   runtime::TypedPackedFunc<IRModule(IRModule, PassContext)> pass_func = [=](IRModule m,
                                                                             PassContext pc) {
-    return relax::CodeGenRunner(m, target_codegens, entry_functions).Run();
+    return relax::CodeGenRunner(m, target_codegens, target_options, entry_functions).Run();
   };
   return CreateModulePass(pass_func, 0, "RunCodegen", {});
 }

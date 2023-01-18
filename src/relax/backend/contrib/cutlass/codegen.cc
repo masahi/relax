@@ -268,6 +268,7 @@ class CutlassModuleCodegen {
 
   /*! \brief The accumulated function names. */
   Array<String> func_names_;
+  Map<String, ObjectRef> options_;
 };  // CutlassModuleCodegen
 
 /*!
@@ -275,14 +276,14 @@ class CutlassModuleCodegen {
  * \param ref The ext_func Relay expression/module to be executed using extern ops.
  * \return A runtime module.
  */
-runtime::Module CUTLASSCompiler(const ObjectRef& ref) {
+runtime::Module CUTLASSCompiler(const ObjectRef& ref, Map<String, ObjectRef> options) {
   ICHECK(ref->IsInstance<FunctionNode>()) << "The input ref is expected to be a Relax function.";
   Function func = Downcast<Function>(ref);
   std::string func_name = backend::GetExtSymbol(func);
   auto source_mod = CutlassModuleCodegen().CreateCSourceModule(func);
   const auto* pf = runtime::Registry::Get("contrib.cutlass.compile");
   ICHECK(pf != nullptr);
-  return (*pf)(source_mod);
+  return (*pf)(source_mod, options);
 }
 
 TVM_REGISTER_GLOBAL("relax.ext.cutlass").set_body_typed(CUTLASSCompiler);
