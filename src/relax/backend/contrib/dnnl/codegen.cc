@@ -91,6 +91,7 @@ class DNNLJSONSerializer : public JSONSerializer {
 
 Array<runtime::Module> DNNLCompiler(Array<Function> functions, Map<String, ObjectRef> /*unused*/) {
   Array<runtime::Module> compiled_functions;
+
   for (const auto& func : functions) {
     auto func_name = backend::GetExtSymbol(func);
     DNNLJSONSerializer serializer(func_name, AnalyzeVar2Value(func));
@@ -101,6 +102,7 @@ Array<runtime::Module> DNNLCompiler(Array<Function> functions, Map<String, Objec
     ICHECK(pf != nullptr) << "Cannot find DNNL runtime module create function.";
     compiled_functions.push_back((*pf)(func_name, graph_json, param_names));
   }
+
   return compiled_functions;
 }
 

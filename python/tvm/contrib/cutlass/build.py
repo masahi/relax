@@ -532,7 +532,7 @@ def _extract_relax_function_info(f):
 
     def fvisit(e):
         nonlocal op_attrs
-        if isinstance(e, tvm.relax.Call) and str(e.op) in ["relax.nn.conv2d"]:
+        if isinstance(e, relax.Call) and str(e.op) in ["relax.nn.conv2d"]:
             op_attrs = e.attrs
 
     relax.analysis.post_order_visit(f.body, fvisit)
@@ -540,68 +540,91 @@ def _extract_relax_function_info(f):
     return signature, op_attrs
 
 
+@relax.expr_functor.mutator
+class CutlassAnnotator(relax.PyExprMutator):
+    def __init__(self, mod, conv2d_profiler, options):
+        super().__init__(mod)
+        self.options = options
+        self.conv2d_profiler = conv2d_profiler
+
+    def visit_function_(self, f):
+        if "Composite" not in f.attrs:
+            body = super().visit_expr(f.body)
+            return relax.Function(f.params, body, f.ret_struct_info, f.attrs, f.span)
+
+        op_type = f.attrs["Composite"]
+
+        if "conv2d" not in op_type:
+            assert False
+
+        signature, op_attrs = _extract_relax_function_info(f)
+
+        d_shape = signature["arg0_shape"]
+        w_shape = signature["arg1_shape"]
+        out_shape = signature["ret_shape"]
+        data_dtype = signature["arg0_dtype"]
+        weight_dtype = signature["arg1_dtype"]
+        out_dtype = signature["ret_dtype"]
+        padding = op_attrs["padding"]
+        strides = op_attrs["strides"]
+        dilation = op_attrs["dilation"]
+        conv_kind = ConvKind.Fprop
+
+        use_3xtf32 = self.options.get("use_3xtf32", False)
+        profile_all_alignments = self.options.get("profile_all_alignments", False)
+        find_first_valid = self.options.get("find_first_valid", True)
+        use_multiprocessing = self.options.get("use_multiprocessing", True)
+        split_k_slices = self.options.get("split_k_slices", [1])
+
+        op_name, op_def, _ = self.conv2d_profiler.profile(
+            op_type,
+            d_shape,
+            w_shape,
+            padding,
+            strides,
+            dilation,
+            out_dtype,
+            data_dtype,
+            weight_dtype,
+            use_3xtf32,
+            conv_kind,
+            split_k_slices,
+            profile_all_alignments,
+            find_first_valid=find_first_valid,
+            use_multiprocessing=use_multiprocessing,
+        )
+
+        return f.with_attrs(
+            {
+                "op_type": op_type,
+                "arg0_dtype": data_dtype,
+                "arg1_dtype": weight_dtype,
+                "ret_dtype": out_dtype,
+                "arg0_shape": d_shape,
+                "arg1_shape": w_shape,
+                "ret_shape": out_shape,
+                "strides": strides,
+                "padding": padding,
+                "dilation": dilation,
+                "cutlass_op_name": op_name,
+                "cutlass_op_def": op_def,
+            }
+        )
+
+
 @register_func("contrib.cutlass.tune_relax_function")
-def profile_relax_function(f, options):
+def profile_relax_function(functions, options):
     tmp_dir = options.get("tmp_dir", "./tmp")
     sm = options.get("sm", 80)
-    use_3xtf32 = options.get("use_3xtf32", False)
-    profile_all_alignments = options.get("profile_all_alignments", False)
-    find_first_valid = options.get("find_first_valid", True)
-    use_multiprocessing = options.get("use_multiprocessing", True)
-    split_k_slices = options.get("split_k_slices", [1])
-
-    op_type = f.attrs["Composite"]
-
-    if "conv2d" not in op_type:
-        assert False
-
-    signature, op_attrs = _extract_relax_function_info(f)
-
-    d_shape = signature["arg0_shape"]
-    w_shape = signature["arg1_shape"]
-    out_shape = signature["ret_shape"]
-    data_dtype = signature["arg0_dtype"]
-    weight_dtype = signature["arg1_dtype"]
-    out_dtype = signature["ret_dtype"]
-    padding = op_attrs["padding"]
-    strides = op_attrs["strides"]
-    dilation = op_attrs["dilation"]
-    conv_kind = ConvKind.Fprop
-
     conv2d_profiler = CutlassConv2DProfiler(sm, _get_cutlass_path(), tmp_dir)
 
-    op_name, op_def, _ = conv2d_profiler.profile(
-        op_type,
-        d_shape,
-        w_shape,
-        padding,
-        strides,
-        dilation,
-        out_dtype,
-        data_dtype,
-        weight_dtype,
-        use_3xtf32,
-        conv_kind,
-        split_k_slices,
-        profile_all_alignments,
-        find_first_valid=find_first_valid,
-        use_multiprocessing=use_multiprocessing,
-    )
+    annotated_functions = []
 
-    return {
-        "op_type": op_type,
-        "arg0_dtype": data_dtype,
-        "arg1_dtype": weight_dtype,
-        "ret_dtype": out_dtype,
-        "arg0_shape": d_shape,
-        "arg1_shape": w_shape,
-        "ret_shape": out_shape,
-        "strides": strides,
-        "padding": padding,
-        "dilation": dilation,
-        "cutlass_op_name": op_name,
-        "cutlass_op_def": op_def,
-    }
+    for f in functions:
+        annotator = CutlassAnnotator(tvm.IRModule.from_expr(f), conv2d_profiler, options)
+        annotated_functions.append(annotator.visit_expr(f))
+
+    return annotated_functions
 
 
 @register_func("contrib.cutlass.compile")

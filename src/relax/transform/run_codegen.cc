@@ -27,19 +27,32 @@
 #include <tvm/relax/expr_functor.h>
 #include <tvm/relax/utils.h>
 
-#include "../backend/contrib/utils.h"
-
 #include <iostream>
+
+#include "../backend/contrib/utils.h"
 
 namespace tvm {
 namespace relax {
 
 class CodeGenRunner : ExprMutator {
  public:
-  explicit CodeGenRunner(IRModule mod, Optional<Array<runtime::String>> target_codegens,
-                         Optional<Array<Map<String, ObjectRef>>> target_options,
-                         Array<runtime::String> entry_functions)
-      : ExprMutator(mod), entry_functions_(std::move(entry_functions)) {
+  template <typename T>
+  using string_map = std::unordered_map<std::string, T>;
+  using OptionMap = Map<String, ObjectRef>;
+
+  explicit CodeGenRunner(IRModule mod) : ExprMutator(mod) {}
+
+  IRModule Run(Optional<Array<String>> target_codegens, Optional<Array<OptionMap>> target_options,
+               Array<String> entry_functions) {
+    IRModule mod = builder_->GetContextIRModule();
+    for (const String& entry_func_name : entry_functions) {
+      auto entry_func = mod->Lookup(entry_func_name);
+      auto gvar = mod->GetGlobalVar(entry_func_name);
+      builder_->UpdateFunction(gvar, Downcast<BaseFunc>(VisitExpr(entry_func)));
+    }
+
+    string_map<OptionMap> target_option_map;
+
     if (target_codegens) {
       if (target_options) {
         ICHECK_EQ(target_codegens.value().size(), target_options.value().size());
@@ -48,61 +61,21 @@ class CodeGenRunner : ExprMutator {
       for (size_t i = 0; i < target_codegens.value().size(); ++i) {
         auto target = target_codegens.value()[i];
         if (target_options) {
-          target_codegens_[target] = target_options.value()[i];
+          target_option_map[target] = target_options.value()[i];
         } else {
-          target_codegens_[target] = {};
+          target_option_map[target] = {};
         }
       }
     }
-  }
 
-  IRModule Run() {
-    IRModule mod = builder_->GetContextIRModule();
-    for (const String& entry_func_name : entry_functions_) {
-      auto entry_func = mod->Lookup(entry_func_name);
-      auto gvar = mod->GetGlobalVar(entry_func_name);
-      builder_->UpdateFunction(gvar, Downcast<BaseFunc>(VisitExpr(entry_func)));
-    }
+    auto ext_mods = InvokeCodegen(mod, std::move(target_option_map));
+    auto out_mod = builder_->GetContextIRModule();
 
-    std::unordered_map<std::string, Array<Function>> target_functions_;
-    for (const auto& [gvar, func] : mod->functions) {
-      PostOrderVisit(func, [this, &target_functions_](Expr e) {
-        if (e->IsInstance<FunctionNode>()) {
-          auto f = Downcast<Function>(e);
-          auto opt_codegen = f->GetAttr<String>(attr::kCodegen);
-          if (opt_codegen) {
-            String codegen_str = opt_codegen.value();
-            if (target_codegens_.empty() || target_codegens_.count(codegen_str)) {
-              target_functions_[codegen_str].push_back(f);
-            }
-          }
-        }
-      });
-    }
-
-    Array<runtime::Module> ext_mods;
-
-    for (const auto& [target, functions] : target_functions_) {
-      Map<String, ObjectRef> options;
-      if (auto it = target_codegens_.find(target); it != target_codegens_.end()) {
-        options = it->second;
-      }
-      // Start the codegen process.
-      // Get the codegen with its ffi key.
-      String codegen_name = "relax.ext." + target;
-      auto codegen = runtime::Registry::Get(codegen_name);
-      ICHECK(codegen) << "Codegen is not found: " << codegen_name << "\n";
-
-      Array<runtime::Module> compiled_functions = (*codegen)(functions, options);
-      ext_mods.insert(ext_mods.end(), compiled_functions.begin(), compiled_functions.end());
-    }
-
-    IRModule out_mod = builder_->GetContextIRModule();
     if (ext_mods.size()) {
-      out_mod = WithAttr(out_mod, "external_mods", std::move(ext_mods));
+      out_mod = WithAttr(out_mod, tvm::attr::kExternalMods, std::move(ext_mods));
     }
 
-    return RemoveUnusedFunctions(out_mod, entry_functions_);
+    return RemoveUnusedFunctions(out_mod, entry_functions);
   }
 
   using ExprMutator::VisitExpr_;
@@ -155,19 +128,53 @@ class CodeGenRunner : ExprMutator {
   }
 
  private:
-  Array<runtime::String> entry_functions_;
-  std::unordered_map<std::string, Map<String, ObjectRef>> target_codegens_;
+  Array<runtime::Module> InvokeCodegen(IRModule mod, string_map<OptionMap> target_option_map) {
+    string_map<Array<Function>> target_functions;
+
+    for (const auto& [gvar, func] : mod->functions) {
+      PostOrderVisit(func, [&target_functions, &target_option_map](Expr e) {
+        if (e->IsInstance<FunctionNode>()) {
+          auto f = Downcast<Function>(e);
+          if (auto opt_codegen = f->GetAttr<String>(attr::kCodegen)) {
+            String codegen_str = opt_codegen.value();
+            if (target_option_map.empty() || target_option_map.count(codegen_str)) {
+              target_functions[codegen_str].push_back(f);
+            }
+          }
+        }
+      });
+    }
+
+    Array<runtime::Module> ext_mods;
+
+    for (const auto& [target, functions] : target_functions) {
+      OptionMap options;
+      if (auto it = target_option_map.find(target); it != target_option_map.end()) {
+        options = it->second;
+      }
+      // Start the codegen process.
+      // Get the codegen with its ffi key.
+      String codegen_name = "relax.ext." + target;
+      auto codegen = runtime::Registry::Get(codegen_name);
+      ICHECK(codegen) << "Codegen is not found: " << codegen_name << "\n";
+
+      Array<runtime::Module> compiled_functions = (*codegen)(functions, options);
+      ext_mods.insert(ext_mods.end(), compiled_functions.begin(), compiled_functions.end());
+    }
+
+    return ext_mods;
+  }
 };
 
 }  // namespace relax
 
 namespace transform {
-Pass RunCodegen(Optional<Array<runtime::String>> target_codegens,
-                Optional<Array<Map<String, ObjectRef>>> target_options,
-                Array<runtime::String> entry_functions) {
+Pass RunCodegen(Optional<Array<String>> target_codegens,
+                Optional<Array<relax::CodeGenRunner::OptionMap>> target_options,
+                Array<String> entry_functions) {
   runtime::TypedPackedFunc<IRModule(IRModule, PassContext)> pass_func = [=](IRModule m,
                                                                             PassContext pc) {
-    return relax::CodeGenRunner(m, target_codegens, target_options, entry_functions).Run();
+    return relax::CodeGenRunner(m).Run(target_codegens, target_options, entry_functions);
   };
   return CreateModulePass(pass_func, 0, "RunCodegen", {});
 }
