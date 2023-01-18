@@ -28,7 +28,6 @@
 #include <tvm/relax/utils.h>
 
 #include <iostream>
-#include "tvm/runtime/object.h"
 
 namespace tvm {
 namespace relax {
@@ -36,17 +35,17 @@ namespace relax {
 class CodeGenRunner : ExprMutator {
  public:
   explicit CodeGenRunner(IRModule mod, Optional<Array<runtime::String>> target_codegens,
-			 Optional<Array<Map<String, ObjectRef>>> target_options,
+                         Optional<Array<Map<String, ObjectRef>>> target_options,
                          Array<runtime::String> entry_functions)
       : ExprMutator(mod), entry_functions_(std::move(entry_functions)) {
     if (target_codegens) {
       for (size_t i = 0; i < target_codegens.value().size(); ++i) {
-	std::string target = target_codegens.value()[i];
-	if (target_options) {
-	  target_codegens_[target] = target_options.value()[i];
-	} else {
-	  target_codegens_[target] = {};
-	}
+        auto target = target_codegens.value()[i];
+        if (target_options) {
+          target_codegens_[target] = target_options.value()[i];
+        } else {
+          target_codegens_[target] = {};
+        }
       }
     }
   }
@@ -122,7 +121,7 @@ class CodeGenRunner : ExprMutator {
 
       Map<String, ObjectRef> options;
       if (auto it = target_codegens_.find(codegen_str); it != target_codegens_.end()) {
-	options = it->second;
+        options = it->second;
       }
 
       // Start the codegen process.
@@ -150,7 +149,7 @@ class CodeGenRunner : ExprMutator {
 
 namespace transform {
 Pass RunCodegen(Optional<Array<runtime::String>> target_codegens,
-		Optional<Array<Map<String, ObjectRef>>> target_options,
+                Optional<Array<Map<String, ObjectRef>>> target_options,
                 Array<runtime::String> entry_functions) {
   runtime::TypedPackedFunc<IRModule(IRModule, PassContext)> pass_func = [=](IRModule m,
                                                                             PassContext pc) {

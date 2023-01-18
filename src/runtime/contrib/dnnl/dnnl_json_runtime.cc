@@ -73,7 +73,6 @@ class DNNLJSONRuntime : public JSONRuntimeBase {
 
   /* Thread safe implementation of Run. Keep runtime instance immutable */
   void Run(const TVMArgs& args) const {
-    LOG(INFO) << "Running DNNL";
     auto arg_data_provider = makeIODataProvider(args);
     auto mem_solver = tensor_registry_.MakeSolver(arg_data_provider);
     // Execute primitives one by one

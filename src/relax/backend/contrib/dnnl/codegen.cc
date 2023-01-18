@@ -41,20 +41,14 @@ using JSONGraphNode = tvm::runtime::json::JSONGraphNode;
 using JSONGraphNodeEntry = tvm::runtime::json::JSONGraphNodeEntry;
 using JSONSerializer = backend::contrib::JSONSerializer;
 
-/*!
- * \brief Generates an DNNLModule from a relax expression by serializing the expression to a
- * json representation. DNNL is not required here because use of DNNL APIs is deferred until
- * runtime.
- */
 class DNNLJSONSerializer : public JSONSerializer {
  public:
-  DNNLJSONSerializer(const std::string& symbol, const Expr& expr)
-      : JSONSerializer(symbol, expr), bindings_(AnalyzeVar2Value(expr)) {}
+  DNNLJSONSerializer(const std::string& symbol, const Map<Var, Expr>& bindings)
+      : JSONSerializer(symbol), bindings_(bindings) {}
 
   using JSONSerializer::VisitExpr_;
 
   std::vector<JSONGraphNodeEntry> VisitExpr_(const CallNode* call_node) final {
-    // The call must be to an inline "Composite" function
     const auto* fn_var = call_node->op.as<VarNode>();
     ICHECK(fn_var);
     const auto fn = Downcast<Function>(bindings_[GetRef<Var>(fn_var)]);
@@ -67,6 +61,7 @@ class DNNLJSONSerializer : public JSONSerializer {
 
     const CallNode* root_call = call_node;
     if (name.find("conv2d") != std::string::npos) {
+      // TODO: clean
       for (auto [var, val] : bindings_) {
         if (val->IsInstance<CallNode>() && backend::IsOp(val.as<CallNode>(), "relax.nn.conv2d")) {
           root_call = val.as<CallNode>();
@@ -94,18 +89,13 @@ class DNNLJSONSerializer : public JSONSerializer {
   Map<Var, Expr> bindings_;
 };
 
-/*!
- * \brief Create a runtime module for DNNL.
- * \param ref The ext_func Relay expression/module to be executed using extern ops.
- * \return A runtime module.
- */
-runtime::Module DNNLCompiler(const ObjectRef& ref, Map<String, ObjectRef>/*unused*/) {
+runtime::Module DNNLCompiler(const ObjectRef& ref, Map<String, ObjectRef> /*unused*/) {
   ICHECK(ref->IsInstance<FunctionNode>()) << "The input ref is expected to be a Relax function.";
   Function func = Downcast<Function>(ref);
   std::string func_name = backend::GetExtSymbol(func);
 
-  DNNLJSONSerializer serializer(func_name, func);
-  serializer.serialize();
+  DNNLJSONSerializer serializer(func_name, AnalyzeVar2Value(func));
+  serializer.serialize(func);
   std::string graph_json = serializer.GetJSON();
   auto param_names = serializer.GetParams();
   const auto* pf = runtime::Registry::Get("runtime.DNNLJSONRuntimeCreate");

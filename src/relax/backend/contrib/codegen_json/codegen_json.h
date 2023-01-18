@@ -152,11 +152,9 @@ class JSONSerializer
    * \param symbol The symbol that represents the graph being converted.
    * \param expr The Relax expression to be converted to the JSON form.
    */
-  JSONSerializer(const std::string& symbol, const Expr& expr) : symbol_(symbol), func_(expr) {}
+  JSONSerializer(const std::string& symbol) : symbol_(symbol) {}
 
-  void serialize() {
-    relax::Function func = Downcast<relax::Function>(func_);
-
+  void serialize(Function func) {
     // First we convert all the parameters into input nodes.
     for (const auto& param : func->params) {
       auto node_ptr = std::make_shared<JSONGraphNode>(param->name_hint(), "input" /* op_type_ */);
@@ -415,8 +413,6 @@ class JSONSerializer
  private:
   /*! \brief The symbol that represents the json graph. */
   std::string symbol_;
-  /*! \brief The function to be serialized. */
-  const Expr func_;
   /*! \brief JSON graph nodes. */
   std::vector<JSONGraphObjectPtr> nodes_;
   /*! \brief Output of the JSON graph. */

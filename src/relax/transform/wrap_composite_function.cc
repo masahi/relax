@@ -23,20 +23,18 @@
 #include <tvm/relax/transform.h>
 #include <tvm/relax/utils.h>
 
-#include "tvm/ir/attrs.h"
-#include "tvm/ir/module.h"
-
 namespace tvm {
 namespace relax {
 
 class WrapComposite : public ExprMutator {
  public:
-  explicit WrapComposite(const IRModule& module) : ExprMutator(module) { mod_ = module; }
+  explicit WrapComposite(IRModule mod) : ExprMutator(mod) {}
   using ExprMutator::VisitExpr_;
 
   IRModule Run() {
-    auto gvar = mod_->GetGlobalVar("main");
-    auto func = Downcast<Function>(mod_->Lookup(gvar));
+    auto mod = builder_->GetContextIRModule();
+    auto gvar = mod->GetGlobalVar("main");
+    auto func = Downcast<Function>(mod->Lookup(gvar));
     auto new_func =
         Function(func->params, VisitExpr(func->body), func->ret_struct_info, func->attrs);
     builder_->UpdateFunction(gvar, new_func);
@@ -45,7 +43,7 @@ class WrapComposite : public ExprMutator {
 
   Expr VisitExpr_(const CallNode* call_node) final {
     if (auto const* gvar = call_node->op.as<GlobalVarNode>()) {
-      auto func = mod_->Lookup(GetRef<GlobalVar>(gvar));
+      auto func = builder_->GetContextIRModule()->Lookup(GetRef<GlobalVar>(gvar));
       if (auto composite_name = func->GetAttr<String>(attr::kComposite)) {
         auto new_func = Downcast<Function>(VisitExpr(func));
         auto codegen_name = GetCodegenName(composite_name.value());
@@ -83,8 +81,6 @@ class WrapComposite : public ExprMutator {
                                               "start with a compiler name followed by period.";
     return composite_name.substr(0, delim_pos);
   }
-
-  IRModule mod_;
 };
 
 namespace transform {

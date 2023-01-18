@@ -185,7 +185,7 @@ TVM_DLL Pass RemoveUnusedFunctions(Array<runtime::String> entry_functions);
  * \return The Pass.
  */
 TVM_DLL Pass RunCodegen(Optional<Array<runtime::String>> target_codegens,
-			Optional<Array<Map<String, ObjectRef>>> target_options,
+                        Optional<Array<Map<String, ObjectRef>>> target_options,
                         Array<runtime::String> entry_functions);
 
 }  // namespace transform

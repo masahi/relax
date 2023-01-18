@@ -19,7 +19,7 @@
 
 /*!
  * \file src/relax/backend/contrib/cutlass/codegen.cc
- * \brief Implementation of the CUTLASS JSON serializer.
+ * \brief Implementation of the CUTLASS code generator for Relax.
  */
 #include "../../../../relay/backend/contrib/cutlass/codegen.h"
 
@@ -40,6 +40,7 @@ namespace relax {
 namespace contrib {
 
 using namespace relay::contrib::cutlass;
+
 using Output = relay::contrib::Output;
 using GenerateBodyOutput = relay::contrib::GenerateBodyOutput;
 using relay::contrib::cutlass::GenerateBody;
@@ -199,6 +200,7 @@ class CodegenCutlass : public tvm::relax::backend::MemoizedExprTranslator<std::v
 
     if (pattern_name == "cutlass.conv2d_bias_relu") {
       const CallNode* conv2d_call = caller;
+      // TODO: clean
       for (auto [var, val] : bindings_) {
         if (val->IsInstance<CallNode>() && backend::IsOp(val.as<CallNode>(), "relax.nn.conv2d")) {
           conv2d_call = val.as<CallNode>();
@@ -261,7 +263,7 @@ class CutlassModuleCodegen {
     Optional<String> opt_global_symbol = function->GetAttr<String>(tvm::attr::kGlobalSymbol);
     ICHECK(opt_global_symbol.defined())
         << "CUTLASS functions must have a " << tvm::attr::kGlobalSymbol << " attribute";
-    std::string sid = opt_global_symbol.value();
+    auto sid = opt_global_symbol.value();
     func_names_.push_back(sid);
 
     CodegenCutlass builder(sid, options, AnalyzeVar2Value(function));
@@ -271,13 +273,8 @@ class CutlassModuleCodegen {
 
   /*! \brief The accumulated function names. */
   Array<String> func_names_;
-};  // CutlassModuleCodegen
+};
 
-/*!
- * \brief Create a runtime module for CUTLASS.
- * \param ref The ext_func Relay expression/module to be executed using extern ops.
- * \return A runtime module.
- */
 runtime::Module CUTLASSCompiler(const ObjectRef& ref, Map<String, ObjectRef> options) {
   ICHECK(ref->IsInstance<FunctionNode>()) << "The input ref is expected to be a Relax function.";
   Function func = Downcast<Function>(ref);

@@ -226,7 +226,7 @@ def RemoveUnusedFunctions(entry_functions: Optional[List[str]] = None) -> tvm.ir
 def RunCodegen(
     target_codegens: Optional[List[str]] = None,
     target_options: Optional[List[dict]] = None,
-    entry_functions: Optional[List[str]] = None
+    entry_functions: Optional[List[str]] = None,
 ) -> tvm.ir.transform.Pass:
     """Produce the runtime::Module with an annotated codegen and global symbol.
 

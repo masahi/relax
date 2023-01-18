@@ -516,6 +516,30 @@ def tune_cutlass_function(
     )
 
 
+def _extract_relax_function_info(f):
+    signature = {}
+
+    for i, arg in enumerate(f.params):
+        sinfo = arg.struct_info
+        signature["arg%d_shape" % i] = list(sinfo.shape)
+        signature["arg%d_dtype" % i] = sinfo.dtype
+
+    ret_sinfo = f.ret_struct_info
+    signature["ret_shape"] = list(ret_sinfo.shape)
+    signature["ret_dtype"] = ret_sinfo.dtype
+
+    op_attrs = {}
+
+    def fvisit(e):
+        nonlocal op_attrs
+        if isinstance(e, tvm.relax.Call) and str(e.op) in ["relax.nn.conv2d"]:
+            op_attrs = e.attrs
+
+    relax.analysis.post_order_visit(f.body, fvisit)
+
+    return signature, op_attrs
+
+
 @register_func("contrib.cutlass.tune_relax_function")
 def profile_relax_function(f, options):
     tmp_dir = options.get("tmp_dir", "./tmp")
@@ -524,51 +548,57 @@ def profile_relax_function(f, options):
     profile_all_alignments = options.get("profile_all_alignments", False)
     find_first_valid = options.get("find_first_valid", True)
     use_multiprocessing = options.get("use_multiprocessing", True)
+    split_k_slices = options.get("split_k_slices", [1])
+
+    op_type = f.attrs["Composite"]
+
+    if "conv2d" not in op_type:
+        assert False
+
+    signature, op_attrs = _extract_relax_function_info(f)
+
+    d_shape = signature["arg0_shape"]
+    w_shape = signature["arg1_shape"]
+    out_shape = signature["ret_shape"]
+    data_dtype = signature["arg0_dtype"]
+    weight_dtype = signature["arg1_dtype"]
+    out_dtype = signature["ret_dtype"]
+    padding = op_attrs["padding"]
+    strides = op_attrs["strides"]
+    dilation = op_attrs["dilation"]
+    conv_kind = ConvKind.Fprop
 
     conv2d_profiler = CutlassConv2DProfiler(sm, _get_cutlass_path(), tmp_dir)
 
-    op_type = f.attrs["Composite"]
-    d_shape = [16, 32, 32, 16]
-    w_shape = [32, 3, 3, 16]
-    padding = [1, 1]
-    strides = [1, 1]
-    dilation = [1, 1]
-    out_dtype = "float16"
-    data_dtype = "float16"
-    weight_dtype = "float16"
-    conv_kind = ConvKind.Fprop
-    split_k_slices = [1]
-
-    op_name, op_def, _ = conv2d_profiler.profile(op_type,
-            d_shape,
-            w_shape,
-            padding,
-            strides,
-            dilation,
-            out_dtype,
-            data_dtype,
-            weight_dtype,
-            use_3xtf32,
-            conv_kind,
-            split_k_slices,
-            profile_all_alignments,
-            find_first_valid=find_first_valid,
-            use_multiprocessing=use_multiprocessing,
-        )
+    op_name, op_def, _ = conv2d_profiler.profile(
+        op_type,
+        d_shape,
+        w_shape,
+        padding,
+        strides,
+        dilation,
+        out_dtype,
+        data_dtype,
+        weight_dtype,
+        use_3xtf32,
+        conv_kind,
+        split_k_slices,
+        profile_all_alignments,
+        find_first_valid=find_first_valid,
+        use_multiprocessing=use_multiprocessing,
+    )
 
     return {
-        "arg0_dtype": "float16",
-        "arg1_dtype": "float16",
-        "ret_dtype": "float16",
-        "arg0_shape": "float16",
-        "arg1_dtype": "float16",
-        "op_type": "conv2d_bias_relu",
-        "arg0_shape": [16, 32, 32, 16],
-        "arg1_shape": [32, 3, 3, 16],
-        "ret_shape": [16, 32, 32, 32],
-        "strides": [1, 1],
-        "padding": [1, 1],
-        "dilation": [1, 1],
+        "op_type": op_type,
+        "arg0_dtype": data_dtype,
+        "arg1_dtype": weight_dtype,
+        "ret_dtype": out_dtype,
+        "arg0_shape": d_shape,
+        "arg1_shape": w_shape,
+        "ret_shape": out_shape,
+        "strides": strides,
+        "padding": padding,
+        "dilation": dilation,
         "cutlass_op_name": op_name,
         "cutlass_op_def": op_def,
     }
@@ -578,9 +608,7 @@ def profile_relax_function(f, options):
 def compile_cutlass_module(c_source_module, options):
     tmp_dir = options.get("tmp_dir", "./tmp")
     defaults = {"sm": 80, "threads": -1, "use_fast_math": False}
-    compile_config = {
-        key: options.get(key, defaults[key]) for key in defaults.keys()
-    }
+    compile_config = {key: options.get(key, defaults[key]) for key in defaults.keys()}
 
     function_names = c_source_module.get_function("get_func_names")()
     compile_options = _get_cutlass_compile_options(**compile_config)
