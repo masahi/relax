@@ -36,14 +36,11 @@ namespace relax {
 
 class CodeGenRunner : ExprMutator {
  public:
-  template <typename T>
-  using string_map = std::unordered_map<std::string, T>;
   using OptionMap = Map<String, ObjectRef>;
 
   explicit CodeGenRunner(IRModule mod) : ExprMutator(mod) {}
 
-  IRModule Run(Optional<Array<String>> target_codegens, Optional<Array<OptionMap>> target_options,
-               Array<String> entry_functions) {
+  IRModule Run(Optional<Map<String, OptionMap>> target_options, Array<String> entry_functions) {
     IRModule mod = builder_->GetContextIRModule();
     for (const String& entry_func_name : entry_functions) {
       auto entry_func = mod->Lookup(entry_func_name);
@@ -51,24 +48,7 @@ class CodeGenRunner : ExprMutator {
       builder_->UpdateFunction(gvar, Downcast<BaseFunc>(VisitExpr(entry_func)));
     }
 
-    string_map<OptionMap> target_option_map;
-
-    if (target_codegens) {
-      if (target_options) {
-        ICHECK_EQ(target_codegens.value().size(), target_options.value().size());
-      }
-
-      for (size_t i = 0; i < target_codegens.value().size(); ++i) {
-        auto target = target_codegens.value()[i];
-        if (target_options) {
-          target_option_map[target] = target_options.value()[i];
-        } else {
-          target_option_map[target] = {};
-        }
-      }
-    }
-
-    auto ext_mods = InvokeCodegen(mod, std::move(target_option_map));
+    auto ext_mods = InvokeCodegen(mod, target_options.value_or({}));
     auto out_mod = builder_->GetContextIRModule();
 
     if (ext_mods.size()) {
@@ -128,16 +108,16 @@ class CodeGenRunner : ExprMutator {
   }
 
  private:
-  Array<runtime::Module> InvokeCodegen(IRModule mod, string_map<OptionMap> target_option_map) {
-    string_map<Array<Function>> target_functions;
+  Array<runtime::Module> InvokeCodegen(IRModule mod, Map<String, OptionMap> target_options) {
+    std::unordered_map<std::string, Array<Function>> target_functions;
 
     for (const auto& [gvar, func] : mod->functions) {
-      PostOrderVisit(func, [&target_functions, &target_option_map](Expr e) {
+      PostOrderVisit(func, [&target_functions, &target_options](Expr e) {
         if (e->IsInstance<FunctionNode>()) {
           auto f = Downcast<Function>(e);
           if (auto opt_codegen = f->GetAttr<String>(attr::kCodegen)) {
             String codegen_str = opt_codegen.value();
-            if (target_option_map.empty() || target_option_map.count(codegen_str)) {
+            if (target_options.empty() || target_options.count(codegen_str)) {
               target_functions[codegen_str].push_back(f);
             }
           }
@@ -148,10 +128,7 @@ class CodeGenRunner : ExprMutator {
     Array<runtime::Module> ext_mods;
 
     for (const auto& [target, functions] : target_functions) {
-      OptionMap options;
-      if (auto it = target_option_map.find(target); it != target_option_map.end()) {
-        options = it->second;
-      }
+      OptionMap options = target_options.Get(target).value_or({});
       // Start the codegen process.
       // Get the codegen with its ffi key.
       String codegen_name = "relax.ext." + target;
@@ -169,12 +146,11 @@ class CodeGenRunner : ExprMutator {
 }  // namespace relax
 
 namespace transform {
-Pass RunCodegen(Optional<Array<String>> target_codegens,
-                Optional<Array<relax::CodeGenRunner::OptionMap>> target_options,
+Pass RunCodegen(Optional<Map<String, Map<String, ObjectRef>>> target_options,
                 Array<String> entry_functions) {
   runtime::TypedPackedFunc<IRModule(IRModule, PassContext)> pass_func = [=](IRModule m,
                                                                             PassContext pc) {
-    return relax::CodeGenRunner(m).Run(target_codegens, target_options, entry_functions);
+    return relax::CodeGenRunner(m).Run(target_options, entry_functions);
   };
   return CreateModulePass(pass_func, 0, "RunCodegen", {});
 }

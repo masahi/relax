@@ -93,7 +93,7 @@ def test_conv2d_offload():
         [
             relax.transform.FuseOpsByPattern(["cutlass.conv2d_bias_relu"], [pat]),
             relax.transform.WrapCompositeFunction(),
-            relax.transform.RunCodegen(["cutlass"], [{"sm": 80, "find_first_valid": True}]),
+            relax.transform.RunCodegen({"cutlass": {"sm": 80, "find_first_valid": True}}),
         ]
     )
 
