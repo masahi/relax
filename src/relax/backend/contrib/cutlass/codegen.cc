@@ -259,11 +259,7 @@ class CutlassModuleCodegen {
   std::string GenCutlassFunc(const Function& function, const Map<String, ObjectRef>& options) {
     ICHECK(function.defined()) << "Input error: expect a Relay function.";
 
-    // Record the external symbol for runtime lookup.
-    Optional<String> opt_global_symbol = function->GetAttr<String>(tvm::attr::kGlobalSymbol);
-    ICHECK(opt_global_symbol.defined())
-        << "CUTLASS functions must have a " << tvm::attr::kGlobalSymbol << " attribute";
-    auto sid = opt_global_symbol.value();
+    auto sid = backend::GetExtSymbol(function);
     func_names_.push_back(sid);
 
     CodegenCutlass builder(sid, options, AnalyzeVar2Value(function));
@@ -275,15 +271,17 @@ class CutlassModuleCodegen {
   Array<String> func_names_;
 };
 
-runtime::Module CUTLASSCompiler(const ObjectRef& ref, Map<String, ObjectRef> options) {
-  ICHECK(ref->IsInstance<FunctionNode>()) << "The input ref is expected to be a Relax function.";
-  Function func = Downcast<Function>(ref);
-  std::string func_name = backend::GetExtSymbol(func);
-  auto source_mod = CutlassModuleCodegen().CreateCSourceModule(func, options);
-  const auto* pf = runtime::Registry::Get("contrib.cutlass.compile");
-  ICHECK(pf != nullptr) << "The packed function contrib.cutlass.compile not found, please import "
-                           "tvm.contrib.cutlass.build";
-  return (*pf)(source_mod, options);
+Array<runtime::Module> CUTLASSCompiler(Array<Function> functions, Map<String, ObjectRef> options) {
+  Array<runtime::Module> compiled_functions;
+  for (const auto& func : functions) {
+    auto func_name = backend::GetExtSymbol(func);
+    auto source_mod = CutlassModuleCodegen().CreateCSourceModule(func, options);
+    const auto* pf = runtime::Registry::Get("contrib.cutlass.compile");
+    ICHECK(pf != nullptr) << "The packed function contrib.cutlass.compile not found, please import "
+                             "tvm.contrib.cutlass.build";
+    compiled_functions.push_back((*pf)(source_mod, options));
+  }
+  return compiled_functions;
 }
 
 TVM_REGISTER_GLOBAL("relax.ext.cutlass").set_body_typed(CUTLASSCompiler);

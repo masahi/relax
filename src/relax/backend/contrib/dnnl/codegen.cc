@@ -89,19 +89,19 @@ class DNNLJSONSerializer : public JSONSerializer {
   Map<Var, Expr> bindings_;
 };
 
-runtime::Module DNNLCompiler(const ObjectRef& ref, Map<String, ObjectRef> /*unused*/) {
-  ICHECK(ref->IsInstance<FunctionNode>()) << "The input ref is expected to be a Relax function.";
-  Function func = Downcast<Function>(ref);
-  std::string func_name = backend::GetExtSymbol(func);
-
-  DNNLJSONSerializer serializer(func_name, AnalyzeVar2Value(func));
-  serializer.serialize(func);
-  std::string graph_json = serializer.GetJSON();
-  auto param_names = serializer.GetParams();
-  const auto* pf = runtime::Registry::Get("runtime.DNNLJSONRuntimeCreate");
-  ICHECK(pf != nullptr) << "Cannot find DNNL runtime module create function.";
-  runtime::Module lib = (*pf)(func_name, graph_json, param_names);
-  return lib;
+Array<runtime::Module> DNNLCompiler(Array<Function> functions, Map<String, ObjectRef> /*unused*/) {
+  Array<runtime::Module> compiled_functions;
+  for (const auto& func : functions) {
+    auto func_name = backend::GetExtSymbol(func);
+    DNNLJSONSerializer serializer(func_name, AnalyzeVar2Value(func));
+    serializer.serialize(func);
+    auto graph_json = serializer.GetJSON();
+    auto param_names = serializer.GetParams();
+    const auto* pf = runtime::Registry::Get("runtime.DNNLJSONRuntimeCreate");
+    ICHECK(pf != nullptr) << "Cannot find DNNL runtime module create function.";
+    compiled_functions.push_back((*pf)(func_name, graph_json, param_names));
+  }
+  return compiled_functions;
 }
 
 TVM_REGISTER_GLOBAL("relax.ext.dnnl").set_body_typed(DNNLCompiler);

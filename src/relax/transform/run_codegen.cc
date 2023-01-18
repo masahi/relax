@@ -27,6 +27,8 @@
 #include <tvm/relax/expr_functor.h>
 #include <tvm/relax/utils.h>
 
+#include "../backend/contrib/utils.h"
+
 #include <iostream>
 
 namespace tvm {
@@ -56,6 +58,11 @@ class CodeGenRunner : ExprMutator {
 
   IRModule Run() {
     IRModule mod = builder_->GetContextIRModule();
+    for (const String& entry_func_name : entry_functions_) {
+      auto entry_func = mod->Lookup(entry_func_name);
+      auto gvar = mod->GetGlobalVar(entry_func_name);
+      builder_->UpdateFunction(gvar, Downcast<BaseFunc>(VisitExpr(entry_func)));
+    }
 
     std::unordered_map<std::string, Array<Function>> target_functions_;
     for (const auto& [gvar, func] : mod->functions) {
@@ -86,22 +93,8 @@ class CodeGenRunner : ExprMutator {
       auto codegen = runtime::Registry::Get(codegen_name);
       ICHECK(codegen) << "Codegen is not found: " << codegen_name << "\n";
 
-      Array<runtime::Module> compiled_functions;
-      for (const auto& func : functions) {
-        auto opt_gsymbol = func->GetAttr<String>(tvm::attr::kGlobalSymbol);
-        ICHECK(opt_gsymbol.defined())
-            << "When a codegen is defined, global symbol should be defined together.";
-
-        compiled_functions.push_back((*codegen)(func, options));
-      }
-
+      Array<runtime::Module> compiled_functions = (*codegen)(functions, options);
       ext_mods.insert(ext_mods.end(), compiled_functions.begin(), compiled_functions.end());
-    }
-
-    for (const String& entry_func_name : entry_functions_) {
-      auto entry_func = mod->Lookup(entry_func_name);
-      auto gvar = mod->GetGlobalVar(entry_func_name);
-      builder_->UpdateFunction(gvar, Downcast<BaseFunc>(VisitExpr(entry_func)));
     }
 
     IRModule out_mod = builder_->GetContextIRModule();
@@ -155,10 +148,7 @@ class CodeGenRunner : ExprMutator {
     Function func = GetRef<Function>(func_node);
     auto opt_codegen = func->GetAttr<String>(attr::kCodegen);
     if (opt_codegen) {
-      auto opt_gsymbol = func->GetAttr<String>(tvm::attr::kGlobalSymbol);
-      ICHECK(opt_gsymbol.defined())
-          << "When a codegen is defined, global symbol should be defined together.";
-      return ExternFunc(opt_gsymbol.value());
+      return ExternFunc(backend::GetExtSymbol(func));
     } else {
       return ExprMutator::VisitExpr_(func_node);
     }
