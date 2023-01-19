@@ -247,8 +247,9 @@ class JSONSerializer : public tvm::relax::backend::MemoizedExprTranslator<NodeEn
 
   NodeEntries VisitBinding_(const VarBindingNode* binding) {
     ICHECK_EQ(memo_.count(binding->var), 0);
-    memo_[binding->var] = VisitExpr(binding->value);
-    return VisitExpr(binding->value);
+    auto v = VisitExpr(binding->value);
+    memo_[binding->var] = v;
+    return v;
   }
 
   NodeEntries VisitBinding_(const MatchCastNode* binding) {

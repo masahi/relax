@@ -68,12 +68,16 @@ def test_dnnl_offload():
     seq = tvm.transform.Sequential(
         [
             relax.transform.FuseOpsByPattern(["dnnl.conv2d_relu"], [pat]),
-            relax.transform.WrapCompositeFunction(),
-            relax.transform.RunCodegen(),
+            relax.transform.FuseCompositeFunctions(),
+            # relax.transform.WrapCompositeFunction(),
+            # relax.transform.RunCodegen(),
         ]
     )
 
     mod = seq(Conv2dReLUx2)
+
+    print(mod.script())
+    return
 
     target = tvm.target.Target("llvm")
     ex = relax.vm.build(mod, target)

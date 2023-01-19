@@ -35,8 +35,11 @@
 #include <tvm/relax/transform.h>
 #include <tvm/tir/function.h>
 
+#include <unordered_map>
+
 #include "../../relay/analysis/graph_partitioner.h"
 #include "../../support/arena.h"
+#include "../backend/contrib/utils.h"
 
 namespace tvm {
 namespace relax {
@@ -385,9 +388,12 @@ class FunctionCreator : public ExprMutator {
           }
           // TODO(tvm-team): handle shape expr
         } else {
-          ICHECK(call->op->IsInstance<OpNode>()) << "Only support relax.call_tir or high-level "
-                                                    "operators as the callee op for CallNode.";
-          name_hint_ = name_hint_ + "_" + Downcast<Op>(call->op)->name;
+          if (call->op->IsInstance<OpNode>()) {
+            name_hint_ = name_hint_ + "_" + Downcast<Op>(call->op)->name;
+          } else if (call->op->IsInstance<GlobalVarNode>()) {
+            name_hint_ = name_hint_ + "_" + Downcast<GlobalVar>(call->op)->name_hint;
+          }
+
           for (const Expr& arg : call->args) {
             CheckDefAndUpdateParam(arg);
           }
@@ -882,6 +888,213 @@ IRModule FuseOpsByPattern(const tvm::Array<String>& pattern_names,
   return mod;
 }
 
+namespace {
+
+struct TargetLabel {
+  std::string target;
+  size_t id = 0;
+};
+
+const std::string kDefaultTarget = "default";
+const std::string kAny = "any";
+
+class AnnotateTargetLabel : public backend::MemoizedExprTranslator<TargetLabel> {
+ public:
+  using Base = backend::MemoizedExprTranslator<TargetLabel>;
+  using Output = std::unordered_map<Expr, TargetLabel, ObjectPtrHash, ObjectPtrEqual>;
+  explicit AnnotateTargetLabel(IRModule mod) : mod_(mod) {}
+
+  Output Run(Function func) {
+    for (const auto& param : func->params) {
+      memo_[param] = TargetLabel{kAny, 0};
+    }
+    VisitExpr(func->body);
+    return memo_;
+  }
+
+  TargetLabel VisitBinding_(const VarBindingNode* binding) {
+    ICHECK_EQ(memo_.count(binding->var), 0);
+    auto v = VisitExpr(binding->value);
+    memo_[binding->var] = v;
+    return v;
+  }
+
+  TargetLabel VisitBinding(const Binding& binding) {
+    if (const auto* node = binding.as<VarBindingNode>()) {
+      return VisitBinding_(node);
+    } else {
+      LOG(FATAL) << "TypeError: Invalid type: " << binding->GetTypeKey();
+    }
+  }
+
+  TargetLabel VisitBindingBlock_(const BindingBlockNode* block) {
+    for (Binding binding : block->bindings) {
+      VisitBinding(binding);
+    }
+    return TargetLabel{kAny, 0};
+  }
+
+  TargetLabel VisitBindingBlock_(const DataflowBlockNode* block) {
+    for (Binding binding : block->bindings) {
+      VisitBinding(binding);
+    }
+    return TargetLabel{kAny, 0};
+  }
+
+  TargetLabel VisitBindingBlock(const BindingBlock& block) {
+    if (const auto* node = block.as<DataflowBlockNode>()) {
+      return VisitBindingBlock_(node);
+    } else if (const auto* node = block.as<BindingBlockNode>()) {
+      return VisitBindingBlock_(node);
+    } else {
+      LOG(FATAL) << "TypeError: Invalid type: " << block->GetTypeKey();
+    }
+  }
+
+  TargetLabel VisitExpr_(const SeqExprNode* op) {
+    for (BindingBlock block : op->blocks) {
+      VisitBindingBlock(block);
+    }
+
+    return VisitExpr(op->body);
+  }
+
+  TargetLabel VisitExpr_(const VarNode* vn) {
+    ICHECK(memo_.count(GetRef<Expr>(vn)));
+    return memo_[GetRef<Expr>(vn)];
+  }
+
+  TargetLabel VisitExpr_(const CallNode* call) {
+    auto const* gvar = call->op.as<GlobalVarNode>();
+    if (!gvar) {
+      return TargetLabel{kDefaultTarget, 0};
+    }
+
+    auto func = mod_->Lookup(GetRef<GlobalVar>(gvar));
+    auto composite_name_opt = func->GetAttr<String>(attr::kComposite);
+    if (!composite_name_opt) {
+      return TargetLabel{kDefaultTarget, 0};
+    }
+
+    std::string composite_name = composite_name_opt.value();
+
+    bool can_merge = true;
+    size_t arg_id = 0;
+    for (const auto& arg : call->args) {
+      ICHECK(memo_.count(arg));
+      auto arg_label = memo_[arg];
+      if (arg_label.target != composite_name && arg_label.target != kAny) {
+        can_merge = false;
+      } else if (arg_label.target == composite_name) {
+        arg_id = std::max(arg_id, arg_label.id);
+      }
+    }
+
+    if (!can_merge) {
+      if (!counter.count(composite_name)) {
+        counter[composite_name] = 0;
+      }
+      size_t new_id = ++counter[composite_name];
+      return TargetLabel{composite_name, new_id};
+    }
+
+    return TargetLabel{composite_name, arg_id};
+  }
+
+ private:
+  IRModule mod_;
+  std::unordered_map<std::string, int> counter;
+};
+
+class PostProcessFusedComposite : public ExprMutator {
+ public:
+  explicit PostProcessFusedComposite(IRModule mod) : ExprMutator(mod), mod_(mod) {}
+  using ExprMutator::VisitExpr_;
+
+  Function Run(Function func) {
+    target_name_ = "";
+    auto new_body = VisitExpr(func->body);
+    ICHECK(!target_name_.empty());
+    return WithAttr(
+        Function(func->params, new_body, func->ret_struct_info, func->attrs, func->span),
+        attr::kCodegen, target_name_);
+  }
+
+  Expr VisitExpr_(const CallNode* call) {
+    if (call->op->IsInstance<GlobalVarNode>()) {
+      auto gvar = Downcast<GlobalVar>(call->op);
+      auto func = Downcast<Function>(mod_->Lookup(gvar));
+      auto composite_name_opt = func->GetAttr<String>(attr::kComposite);
+      ICHECK(composite_name_opt);
+      std::string composite_name = composite_name_opt.value();
+      auto tgt_name = GetCodegenName(composite_name);
+      if (!target_name_.empty()) {
+        ICHECK(tgt_name == target_name_);
+      } else {
+        target_name_ = tgt_name;
+      }
+      return Call(func, call->args);
+    }
+    return ExprMutator::VisitExpr_(call);
+  }
+
+ private:
+  String GetCodegenName(const std::string& composite_name) {
+    auto delim_pos = composite_name.find(".");
+    ICHECK(delim_pos != std::string::npos) << "The pattern name for a composite function should "
+                                              "start with a compiler name followed by period.";
+    return composite_name.substr(0, delim_pos);
+  }
+  IRModule mod_;
+  String target_name_;
+};
+
+}  // namespace
+
+IRModule FuseCompositeFunctions(IRModule mod) {
+  AnnotateTargetLabel annot(mod);
+  auto gvar = mod->GetGlobalVar("main");
+  auto func = Downcast<Function>(mod->Lookup(gvar));
+  auto target_labels = annot.Run(func);
+
+  support::Arena arena;
+
+  using Group = GraphPartitioner::Group;
+  OperatorFusor::GroupMap group_map;
+  std::unordered_map<std::string, std::unordered_set<int>> created_group_ids;
+  std::unordered_map<std::string, Group*> label_group;
+
+  for (const auto& [expr, label] : target_labels) {
+    if (label.target != kAny && label.target != kDefaultTarget) {
+      auto key = label.target + std::to_string(label.id);
+
+      if (!created_group_ids[label.target].count(label.id)) {
+        created_group_ids[label.target].insert(label.id);
+        auto new_g = arena.make<Group>();
+        label_group[key] = new_g;
+        group_map[expr.get()] = new_g;
+      } else {
+        ICHECK(label_group.count(key));
+        ++label_group[key]->num_nodes;
+        group_map[expr.get()] = label_group[key];
+      }
+    } else {
+      group_map[expr.get()] = arena.make<Group>();
+    }
+  }
+
+  auto new_mod = OperatorFusor(mod, group_map).Transform();
+
+  PostProcessFusedComposite postproc(mod);
+  for (const auto& [gvar, func] : new_mod->functions) {
+    if (!mod->functions.count(gvar)) {
+      new_mod->Update(gvar, postproc.Run(Downcast<Function>(func)));
+    }
+  }
+
+  return RemoveUnusedFunctions(new_mod, {"main"});
+}
+
 namespace transform {
 
 Pass FuseOps(int fuse_opt_level) {
@@ -912,6 +1125,18 @@ Pass FuseOpsByPattern(const tvm::Array<String>& pattern_names,
 }
 
 TVM_REGISTER_GLOBAL("relax.transform.FuseOpsByPattern").set_body_typed(FuseOpsByPattern);
+
+Pass FuseCompositeFunctions() {
+  runtime::TypedPackedFunc<IRModule(IRModule, PassContext)> pass_func =  //
+      [=](IRModule mod, PassContext pc) { return relax::FuseCompositeFunctions(mod); };
+  return CreateModulePass(/*pass_function=*/pass_func,       //
+                          /*opt_level=*/0,                   //
+                          /*pass_name=*/"FuseOpsByPattern",  //
+                          /*required=*/{});
+}
+
+TVM_REGISTER_GLOBAL("relax.transform.FuseCompositeFunctions")
+    .set_body_typed(FuseCompositeFunctions);
 
 }  // namespace transform
 
