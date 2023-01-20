@@ -944,36 +944,51 @@ IRModule FuseOpsByPattern(const tvm::Array<String>& pattern_names,
 
 namespace {
 
-struct TargetLabel {
+String GetCodegenName(const std::string& composite_name) {
+  auto delim_pos = composite_name.find(".");
+  ICHECK(delim_pos != std::string::npos) << "The pattern name for a composite function should "
+                                            "start with a compiler name followed by period.";
+  return composite_name.substr(0, delim_pos);
+}
+
+struct CompositeGroup {
+  GraphPartitioner::Group* representative;
   std::string target;
-  size_t id = 0;
 };
 
-const std::string kDefaultTarget = "default";
-const std::string kAny = "any";
-
-class AnnotateTargetLabel : public backend::MemoizedExprTranslator<TargetLabel> {
+class BuildCompositeGroups : public backend::MemoizedExprTranslator<CompositeGroup> {
  public:
-  using Base = backend::MemoizedExprTranslator<TargetLabel>;
-  using Output = std::unordered_map<Expr, TargetLabel, ObjectPtrHash, ObjectPtrEqual>;
-  explicit AnnotateTargetLabel(IRModule mod) : mod_(mod) {}
+  using Group = GraphPartitioner::Group;
+  BuildCompositeGroups(IRModule mod, support::Arena* arena)
+      : mod_(mod), arena_(arena), default_group_(CompositeGroup{nullptr, kDefaultTarget}) {}
 
-  Output Run(Function func) {
+  OperatorFusor::GroupMap Run(Function func) {
     for (const auto& param : func->params) {
-      memo_[param] = TargetLabel{kAny, 0};
+      memo_[param] = CompositeGroup{nullptr, kAny};
     }
     VisitExpr(func->body);
-    return memo_;
+
+    OperatorFusor::GroupMap group_map;
+    for (const auto& [expr, group] : memo_) {
+      if (group.representative) {
+        group_map[expr.get()] = group.representative;
+      } else {
+        group_map[expr.get()] = arena_->make<GraphPartitioner::Group>();
+      }
+    }
+
+    return group_map;
   }
 
-  TargetLabel VisitBinding_(const VarBindingNode* binding) {
+  CompositeGroup VisitBinding_(const VarBindingNode* binding) {
     ICHECK_EQ(memo_.count(binding->var), 0);
     auto v = VisitExpr(binding->value);
     memo_[binding->var] = v;
+    LOG(INFO) << binding->var->name_hint() << ", " << binding->value << ", " << v.representative;
     return v;
   }
 
-  TargetLabel VisitBinding(const Binding& binding) {
+  CompositeGroup VisitBinding(const Binding& binding) {
     if (const auto* node = binding.as<VarBindingNode>()) {
       return VisitBinding_(node);
     } else {
@@ -981,21 +996,21 @@ class AnnotateTargetLabel : public backend::MemoizedExprTranslator<TargetLabel> 
     }
   }
 
-  TargetLabel VisitBindingBlock_(const BindingBlockNode* block) {
+  CompositeGroup VisitBindingBlock_(const BindingBlockNode* block) {
     for (Binding binding : block->bindings) {
       VisitBinding(binding);
     }
-    return TargetLabel{kAny, 0};
+    return default_group_;
   }
 
-  TargetLabel VisitBindingBlock_(const DataflowBlockNode* block) {
+  CompositeGroup VisitBindingBlock_(const DataflowBlockNode* block) {
     for (Binding binding : block->bindings) {
       VisitBinding(binding);
     }
-    return TargetLabel{kAny, 0};
+    return CompositeGroup{nullptr, kAny};
   }
 
-  TargetLabel VisitBindingBlock(const BindingBlock& block) {
+  CompositeGroup VisitBindingBlock(const BindingBlock& block) {
     if (const auto* node = block.as<DataflowBlockNode>()) {
       return VisitBindingBlock_(node);
     } else if (const auto* node = block.as<BindingBlockNode>()) {
@@ -1005,64 +1020,98 @@ class AnnotateTargetLabel : public backend::MemoizedExprTranslator<TargetLabel> 
     }
   }
 
-  TargetLabel VisitExpr_(const SeqExprNode* op) {
+  CompositeGroup VisitExpr_(const SeqExprNode* op) {
     for (BindingBlock block : op->blocks) {
       VisitBindingBlock(block);
     }
-
     return VisitExpr(op->body);
   }
 
-  TargetLabel VisitExpr_(const VarNode* vn) {
+  CompositeGroup VisitExpr_(const VarNode* vn) {
     ICHECK(memo_.count(GetRef<Expr>(vn)));
     return memo_[GetRef<Expr>(vn)];
   }
 
-  TargetLabel VisitExpr_(const CallNode* call) {
+  CompositeGroup VisitExpr_(const CallNode* call) {
     auto const* gvar = call->op.as<GlobalVarNode>();
     if (!gvar) {
-      return TargetLabel{kDefaultTarget, 0};
+      return default_group_;
     }
 
-    auto func = mod_->Lookup(GetRef<GlobalVar>(gvar));
-    auto composite_name_opt = func->GetAttr<String>(attr::kComposite);
+    auto composite_name_opt =
+        mod_->Lookup(GetRef<GlobalVar>(gvar))->GetAttr<String>(attr::kComposite);
     if (!composite_name_opt) {
-      return TargetLabel{kDefaultTarget, 0};
+      return default_group_;
     }
 
-    std::string composite_name = composite_name_opt.value();
+    std::string composite_name = GetCodegenName(composite_name_opt.value());
 
-    bool can_merge = true;
-    size_t arg_id = 0;
-    for (const auto& arg : call->args) {
-      ICHECK(memo_.count(arg));
-      auto arg_label = memo_[arg];
-      if (arg_label.target != composite_name && arg_label.target != kAny) {
-        can_merge = false;
-      } else if (arg_label.target == composite_name) {
-        arg_id = std::max(arg_id, arg_label.id);
+    auto rep_group = GetRepresentative(call->args, composite_name);
+
+    if (rep_group->num_nodes != 0) {
+      for (const auto& arg : call->args) {
+        auto& arg_group = memo_[arg];
+        if (arg_group.target == composite_name && arg_group.representative != rep_group) {
+          rep_group->num_nodes += arg_group.representative->num_nodes;
+          arg_group.representative->num_nodes = 0;
+          arg_group.representative = rep_group;
+        }
       }
     }
 
-    if (!can_merge) {
-      if (!counter.count(composite_name)) {
-        counter[composite_name] = 0;
-      }
-      size_t new_id = ++counter[composite_name];
-      return TargetLabel{composite_name, new_id};
-    }
-
-    return TargetLabel{composite_name, arg_id};
+    ++rep_group->num_nodes;
+    return CompositeGroup{rep_group, composite_name};
   }
 
  private:
+  Group* GetRepresentative(const Array<Expr>& args, const std::string& composite_name) {
+    Group* rep = nullptr;
+
+    std::unordered_set<Group*> parent_deps;
+
+    for (const auto& arg : args) {
+      for (auto parent_dep : group_deps_[memo_[arg].representative]) {
+        parent_deps.insert(parent_dep);
+      }
+    }
+
+    for (const auto& arg : args) {
+      auto arg_group = memo_[arg];
+      if (arg_group.target == composite_name && !parent_deps.count(arg_group.representative)) {
+        rep = arg_group.representative;
+      }
+    }
+
+    if (rep == nullptr) {
+      rep = arena_->make<Group>();
+      rep->num_nodes = 0;
+    }
+
+    for (const auto& arg : args) {
+      auto arg_group = memo_[arg];
+      if (arg_group.target != composite_name) {
+        group_deps_[rep].insert(arg_group.representative);
+      }
+    }
+
+    for (auto parent_dep : parent_deps) {
+      group_deps_[rep].insert(parent_dep);
+    }
+
+    return rep;
+  }
+
+  const std::string kDefaultTarget = "default";
+  const std::string kAny = "any";
   IRModule mod_;
-  std::unordered_map<std::string, int> counter;
+  support::Arena* arena_;
+  CompositeGroup default_group_;
+  std::unordered_map<Group*, std::unordered_set<Group*>> group_deps_;
 };
 
-class PostProcessFusedComposite : public ExprMutator {
+class InlineComposite : public ExprMutator {
  public:
-  explicit PostProcessFusedComposite(IRModule mod) : ExprMutator(mod), mod_(mod) {}
+  explicit InlineComposite(IRModule mod) : ExprMutator(mod), mod_(mod) {}
   using ExprMutator::VisitExpr_;
 
   Function Run(Function func) {
@@ -1093,12 +1142,6 @@ class PostProcessFusedComposite : public ExprMutator {
   }
 
  private:
-  String GetCodegenName(const std::string& composite_name) {
-    auto delim_pos = composite_name.find(".");
-    ICHECK(delim_pos != std::string::npos) << "The pattern name for a composite function should "
-                                              "start with a compiler name followed by period.";
-    return composite_name.substr(0, delim_pos);
-  }
   IRModule mod_;
   String target_name_;
 };
@@ -1106,40 +1149,13 @@ class PostProcessFusedComposite : public ExprMutator {
 }  // namespace
 
 IRModule FuseCompositeFunctions(IRModule mod) {
-  AnnotateTargetLabel annot(mod);
   auto gvar = mod->GetGlobalVar("main");
   auto func = Downcast<Function>(mod->Lookup(gvar));
-  auto target_labels = annot.Run(func);
-
   support::Arena arena;
-
-  using Group = GraphPartitioner::Group;
-  OperatorFusor::GroupMap group_map;
-  std::unordered_map<std::string, std::unordered_set<int>> created_group_ids;
-  std::unordered_map<std::string, Group*> label_group;
-
-  for (const auto& [expr, label] : target_labels) {
-    if (label.target != kAny && label.target != kDefaultTarget) {
-      auto key = label.target + std::to_string(label.id);
-
-      if (!created_group_ids[label.target].count(label.id)) {
-        created_group_ids[label.target].insert(label.id);
-        auto new_g = arena.make<Group>();
-        label_group[key] = new_g;
-        group_map[expr.get()] = new_g;
-      } else {
-        ICHECK(label_group.count(key));
-        ++label_group[key]->num_nodes;
-        group_map[expr.get()] = label_group[key];
-      }
-    } else {
-      group_map[expr.get()] = arena.make<Group>();
-    }
-  }
-
+  auto group_map = BuildCompositeGroups(mod, &arena).Run(func);
   auto new_mod = OperatorFusor(mod, group_map).Transform();
 
-  PostProcessFusedComposite postproc(mod);
+  InlineComposite postproc(mod);
   for (const auto& [gvar, func] : new_mod->functions) {
     if (!mod->functions.count(gvar)) {
       auto new_func = postproc.Run(Downcast<Function>(func));
