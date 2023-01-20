@@ -91,7 +91,7 @@ def test_conv2d_offload():
 
     seq = tvm.transform.Sequential(
         [
-            relax.transform.FuseOpsByPattern(["cutlass.conv2d_bias_relu"], [pat]),
+            relax.transform.FuseOpsByPattern([("cutlass.conv2d_bias_relu", pat)]),
             relax.transform.FuseCompositeFunctions(),
             relax.transform.RunCodegen({"cutlass": {"sm": 80, "find_first_valid": True}}),
         ]
