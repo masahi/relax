@@ -59,10 +59,11 @@ class DNNLJSONSerializer : public JSONSerializer {
 
     std::string name = opt_composite.value();
 
+    auto local_bindings = AnalyzeVar2Value(fn);
     const CallNode* root_call = call_node;
     if (name.find("conv2d") != std::string::npos) {
       // TODO: clean
-      for (auto [var, val] : bindings_) {
+      for (auto [var, val] : local_bindings) {
         if (val->IsInstance<CallNode>() && backend::IsOp(val.as<CallNode>(), "relax.nn.conv2d")) {
           root_call = val.as<CallNode>();
           break;

@@ -22,6 +22,8 @@
  * \brief The helper function for op fusion.
  */
 
+#include <optional>
+
 #include <tvm/relay/op_attr_types.h>
 
 #include "../../support/arena.h"
@@ -176,7 +178,7 @@ class GraphPartitioner {
      */
     uint32_t num_nodes{1};
 
-    std::string composite_name;
+    std::optional<std::string> composite_name;
     /*!
      * \brief Find the group root, perform path compression
      * \return The root type node.

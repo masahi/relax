@@ -36,6 +36,7 @@
 #include <tvm/tir/function.h>
 
 #include <unordered_map>
+#include <optional>
 
 #include "../../relay/analysis/graph_partitioner.h"
 #include "../../support/arena.h"
@@ -1135,7 +1136,8 @@ IRModule FuseCompositeFunctions(IRModule mod) {
   PostProcessFusedComposite postproc(mod);
   for (const auto& [gvar, func] : new_mod->functions) {
     if (!mod->functions.count(gvar)) {
-      new_mod->Update(gvar, postproc.Run(Downcast<Function>(func)));
+      auto new_func = postproc.Run(Downcast<Function>(func));
+      new_mod->Update(gvar, WithAttr(new_func, tvm::attr::kGlobalSymbol, gvar->name_hint));
     }
   }
 

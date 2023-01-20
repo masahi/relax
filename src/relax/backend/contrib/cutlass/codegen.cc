@@ -194,7 +194,8 @@ class CodegenCutlass : public tvm::relax::backend::MemoizedExprTranslator<std::v
     if (pattern_name == "cutlass.conv2d_bias_relu") {
       const CallNode* conv2d_call = caller;
       // TODO: clean
-      for (auto [var, val] : bindings_) {
+      auto local_bindings = AnalyzeVar2Value(callee);
+      for (auto [var, val] : local_bindings) {
         if (val->IsInstance<CallNode>() && backend::IsOp(val.as<CallNode>(), "relax.nn.conv2d")) {
           conv2d_call = val.as<CallNode>();
           break;
