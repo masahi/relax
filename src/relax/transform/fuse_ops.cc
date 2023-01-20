@@ -417,31 +417,37 @@ class FunctionCreator : public ExprMutator {
   }
 
   /*! \brief Set a var defined in the group as output. */
-  void AppendOutput(const Var& var) {
+  size_t AppendOutput(const Var& var) {
     ICHECK(defined_vars_.count(var.get()));
-    output_vars_.insert(var.get());
+    auto output_idx = GetOutputIndex(var);
+    if (output_idx) {
+      return *output_idx;
+    }
+    output_vars_.push_back(var.get());
+    return output_vars_.size() - 1;
   }
 
   /*!
    * \brief Create the grouped function according according to the collected bindings and parameters
+   * \param composite_name The name to identify the pattern this function is created from, if any.
+   * It will become the value of the kComposite attribute of the created function.
    * \note The created function won't be returned immediately. It's stored in the `function_` field.
    */
-  void CreateFunction(const std::string& composite_name) {
+  void CreateFunction(std::optional<std::string> composite_name) {
     // Step 1. Start constructing a new dataflow block.
     builder_->BeginDataflowBlock();
 
     // Step 2. Visit each binding and collect outputs one by one.
-    Array<Expr> outputs;
+    Array<Expr> outputs(output_vars_.size(), Expr());
     for (const Binding& binding : bindings_) {
-      const VarNode* var = binding->var.get();
-      if (output_vars_.count(var)) {
+      if (auto output_idx = GetOutputIndex(binding->var)) {
         // Case 1. It is an output binding
         // We only allow VarBinding as output.
         const auto* var_binding = binding.as<VarBindingNode>();
         ICHECK_NOTNULL(var_binding);
         Var output_var = builder_->EmitOutput(VisitExpr(var_binding->value));
         var_remap_[var_binding->var->vid] = output_var;
-        outputs.push_back(output_var);
+        outputs.Set(*output_idx, output_var);
       } else {
         // Case 2. It is an internel binding, add it to the binding list.
         VisitBinding(binding);
@@ -456,8 +462,8 @@ class FunctionCreator : public ExprMutator {
     body = builder_->Normalize(SeqExpr({new_block}, body));
     Map<String, ObjectRef> attrs;
     attrs.Set(tvm::relax::attr::kPrimitive, Integer(1));
-    if (!composite_name.empty()) {
-      attrs.Set(tvm::relax::attr::kComposite, String(composite_name));
+    if (composite_name) {
+      attrs.Set(tvm::relax::attr::kComposite, String(*composite_name));
     }
     function_ = Function(/*params=*/params_,           //
                          /*body=*/body,                //
@@ -477,6 +483,14 @@ class FunctionCreator : public ExprMutator {
   Function function_{nullptr};
 
  private:
+  std::optional<size_t> GetOutputIndex(Var v) {
+    auto it = std::find(output_vars_.begin(), output_vars_.end(), v.get());
+    if (it != output_vars_.end()) {
+      return std::distance(output_vars_.begin(), it);
+    }
+    return std::nullopt;
+  }
+
   /*!
    * \brief Check whether the input expression is defined within this function. If not, create a new
    * parameter for the expression.
@@ -484,8 +498,7 @@ class FunctionCreator : public ExprMutator {
    */
   void CheckDefAndUpdateParam(const Expr& expr) {
     // If the expression has already served as an argument, no need to create another one for it.
-    auto it = std::find(arguments_.begin(), arguments_.end(), expr);
-    if (it != arguments_.end()) {
+    if (std::find(arguments_.begin(), arguments_.end(), expr) != arguments_.end()) {
       return;
     }
 
@@ -522,7 +535,7 @@ class FunctionCreator : public ExprMutator {
   /*! \brief The number of parameters reserved for constants */
   int n_param_for_const_ = 0;
   /*! \brief The output vars */
-  std::unordered_set<const VarNode*> output_vars_;
+  std::vector<const VarNode*> output_vars_;
 };
 
 /*!
@@ -583,6 +596,12 @@ class OperatorFusor : public ExprMutator {
   }
 
  private:
+  bool IsTupleOutput(Function f) {
+    auto sinfo = GetStructInfo(f).as<FuncStructInfoNode>();
+    ICHECK(sinfo);
+    return sinfo->ret->IsInstance<TupleStructInfoNode>();
+  }
+
   BindingBlock VisitBindingBlock(const BindingBlock& block) final {
     if (const auto* df_block = block.as<DataflowBlockNode>()) {
       return VisitBindingBlock_(df_block);
@@ -612,6 +631,11 @@ class OperatorFusor : public ExprMutator {
     //  dependencies among the bindings of different groups. And therefore, we will skip all but the
     //  last binding of the group.
     builder_->BeginDataflowBlock();
+
+    // For each group, record which variables need to be remapped to the output of TupleGetItem.
+    // Only relevant when the output of the grouped function is a tuple.
+    std::unordered_map<GraphPartitioner::Group*, std::vector<Var>> pending_tuple_get;
+
     for (size_t i = 0; i < block->bindings.size(); ++i) {
       const Binding& binding = block->bindings[i];
 
@@ -626,6 +650,13 @@ class OperatorFusor : public ExprMutator {
       const auto& it_creator = group2func_.find(group);
       ICHECK(it_creator != group2func_.end());
       const FunctionCreator& func_info = it_creator->second;
+
+      // If this binding belongs to a group whose output is a tuple, the original bound variable
+      // needs to be remapped to the output of TupleGetItem after the corresponding tuple is
+      // emitted.
+      if (IsTupleOutput(func_info.function_)) {
+        pending_tuple_get[group].push_back(binding->var);
+      }
 
       // Case 2. If the binding is not the last binding of the group, we skip it.
       if (!func_info.bindings_.back().same_as(binding)) {
@@ -653,7 +684,19 @@ class OperatorFusor : public ExprMutator {
       }
 
       // Step c. Update the mapping used for the remapping of the binding variables.
-      var_remap_[var_binding->var->vid] = new_var;
+      if (IsTupleOutput(func_info.function_)) {
+        // If the output is a tuple, attach TupleGetItem to all tuple elements, and
+        // remap variables approriately.
+        // The variables that need to be remapped and the corresponding tuple indices are
+        // available in pending_tuple_get and tuple_get_indices_ respectively.
+        for (const auto& var : pending_tuple_get[group]) {
+          ICHECK(tuple_get_indices_.count(var.get()));
+          auto tuple_get = TupleGetItem(new_var, tuple_get_indices_[var.get()]);
+          var_remap_[var->vid] = builder_->Emit(tuple_get);
+        }
+      } else {
+        var_remap_[var_binding->var->vid] = new_var;
+      }
     }
     // Step 5. Finish the binding block generation.
     return builder_->EndBlock();
@@ -697,7 +740,8 @@ class OperatorFusor : public ExprMutator {
           if (producer_group != cur_group &&
               group2func_.find(producer_group) != group2func_.end()) {
             FunctionCreator& producer_func_info = group2func_[producer_group];
-            producer_func_info.AppendOutput(used_var);
+            auto output_index = producer_func_info.AppendOutput(used_var);
+            tuple_get_indices_[used_var.get()] = output_index;
           }
         }
       };
@@ -759,6 +803,9 @@ class OperatorFusor : public ExprMutator {
   GroupMap obj2group_;
   /*! \brief Internal function information map. */
   std::unordered_map<GraphPartitioner::Group*, FunctionCreator> group2func_;
+  /*! \brief Record the index for TupleGetItem if the variable needs to be remapped to an output
+   * tuple element after fusion. */
+  std::unordered_map<const VarNode*, int> tuple_get_indices_;
 };
 
 IRModule FuseOps(IRModule mod, int opt_level, size_t max_fuse_depth) {
@@ -879,8 +926,8 @@ IRModule FuseOpsByPattern(const tvm::Array<String>& pattern_names,
   support::Arena arena;
   for (size_t i = 0; i < pattern_names.size(); ++i) {
     OperatorFusor::GroupMap group_map;
-    for (const auto& [_, func] : mod->functions) {
-      auto map = PatternBasedPartitioner::Run(pattern_names[i], patterns[i], func, &arena);
+    for (const auto& entry : mod->functions) {
+      auto map = PatternBasedPartitioner::Run(pattern_names[i], patterns[i], entry.second, &arena);
       group_map.insert(map.begin(), map.end());
     }
     mod = OperatorFusor(mod, group_map).Transform();
