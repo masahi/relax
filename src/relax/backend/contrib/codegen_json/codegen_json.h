@@ -39,6 +39,7 @@
 #include "../../../../runtime/contrib/json/json_node.h"
 #include "../../../../runtime/contrib/json/json_runtime.h"
 #include "../utils.h"
+#include "../../../transform/utils.h"
 
 namespace tvm {
 namespace relax {
@@ -145,8 +146,10 @@ class OpAttrExtractor : public AttrVisitor {
 using NodeEntries = std::vector<JSONGraphNodeEntry>;
 
 /*! \brief Serialize a Relax expression to JSON. */
-class JSONSerializer : public tvm::relax::backend::MemoizedExprTranslator<NodeEntries> {
+class JSONSerializer : public MemoizedExprTranslator<NodeEntries> {
  public:
+  using MemoizedExprTranslator<NodeEntries>::VisitExpr_;
+  using MemoizedExprTranslator<NodeEntries>::VisitBinding_;
   /*!
    * \brief Constructor
    *
@@ -245,13 +248,6 @@ class JSONSerializer : public tvm::relax::backend::MemoizedExprTranslator<NodeEn
     }
   }
 
-  NodeEntries VisitBinding_(const VarBindingNode* binding) {
-    ICHECK_EQ(memo_.count(binding->var), 0);
-    auto v = VisitExpr(binding->value);
-    memo_[binding->var] = v;
-    return v;
-  }
-
   NodeEntries VisitBinding_(const MatchCastNode* binding) {
     LOG(FATAL) << "JSON runtime currently doesn't match cast\n";
     return {};
@@ -320,11 +316,6 @@ class JSONSerializer : public tvm::relax::backend::MemoizedExprTranslator<NodeEn
   NodeEntries VisitExprDefault_(const Object* op) {
     LOG(FATAL) << "JSON runtime currently doesn't support " << op->GetTypeKey();
     return {};
-  }
-
-  NodeEntries VisitExpr_(const VarNode* vn) {
-    ICHECK(memo_.count(GetRef<Expr>(vn)));
-    return memo_[GetRef<Expr>(vn)];
   }
 
   NodeEntries VisitExpr_(const ConstantNode* cn) {

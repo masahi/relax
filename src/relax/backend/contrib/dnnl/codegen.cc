@@ -94,7 +94,7 @@ Array<runtime::Module> DNNLCompiler(Array<Function> functions, Map<String, Objec
   Array<runtime::Module> compiled_functions;
 
   for (const auto& func : functions) {
-    auto func_name = backend::GetExtSymbol(func);
+    auto func_name = GetExtSymbol(func);
     DNNLJSONSerializer serializer(func_name, AnalyzeVar2Value(func));
     serializer.serialize(func);
     auto graph_json = serializer.GetJSON();
