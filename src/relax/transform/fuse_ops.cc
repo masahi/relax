@@ -35,9 +35,6 @@
 #include <tvm/relax/transform.h>
 #include <tvm/tir/function.h>
 
-#include <deque>
-#include <unordered_set>
-
 #include "../../support/arena.h"
 #include "utils.h"
 
@@ -558,7 +555,6 @@ class OperatorFusor : public ExprMutator {
  public:
   using Group = GraphPartitioner::Group;
   using GroupMap = std::unordered_map<const Object*, Group*>;
-  using VarSet = std::unordered_set<const VarNode*>;
 
   /*!
    * \brief Construct a new operator fusor. Given the indexed-forward graph and the graph partition
@@ -645,30 +641,8 @@ class OperatorFusor : public ExprMutator {
     // For each group, record which variables need to be remapped to the output of TupleGetItem.
     // Only relevant when the output of the grouped function is a tuple.
     std::unordered_map<Group*, std::vector<Var>> pending_tuple_get;
-    std::unordered_map<const BindingNode*, VarSet> pending_tuple_get_bindings;
-    VarSet vars_pending_remap;
-    std::deque<Binding> pending_bindings;
 
-    for (auto entry : tuple_get_indices_) {
-      auto var = entry.first;
-      Group* group = GetGroupFromVar(GetRef<Var>(var));
-      const auto& it_creator = group2func_.find(group);
-      ICHECK(it_creator != group2func_.end());
-      const FunctionCreator& func_info = it_creator->second;
-
-      if (IsTupleOutput(func_info.function_)) {
-        vars_pending_remap.insert(var);
-      }
-    }
-
-    for (auto binding : block->bindings) {
-      pending_bindings.push_back(binding);
-    }
-
-    while (!pending_bindings.empty()) {
-      Binding binding = pending_bindings.front();
-      pending_bindings.pop_front();
-
+    for (const auto& binding: TopoSortByGroupDep(block->bindings)) {
       // Case 1. If the binding is the only binding in its group, recurse into it and emit the
       // transformed binding as usual.
       Group* group = GetGroupFromBinding(binding);
@@ -686,25 +660,6 @@ class OperatorFusor : public ExprMutator {
       // emitted.
       if (IsTupleOutput(func_info.function_) && tuple_get_indices_.count(binding->var.get())) {
         pending_tuple_get[group].push_back(binding->var);
-      } else {
-        if (const auto* var_binding = binding.as<VarBindingNode>()) {
-          VarSet unremapped_vars;
-          PostOrderVisit(var_binding->value,
-                         [&unremapped_vars, &vars_pending_remap](const Expr& e) {
-                           if (e->IsInstance<VarNode>()) {
-                             auto used_var = Downcast<Var>(e);
-                             if (vars_pending_remap.count(used_var.get())) {
-                               unremapped_vars.insert(used_var.get());
-                             }
-                           }
-                         });
-
-          if (!unremapped_vars.empty()) {
-            pending_tuple_get_bindings[binding.get()] = unremapped_vars;
-            vars_pending_remap.insert(binding->var.get());
-            continue;
-          }
-        }
       }
 
       // Case 2. If the binding is not the last binding of the group, we skip it.
@@ -732,7 +687,6 @@ class OperatorFusor : public ExprMutator {
         new_var = builder_->EmitOutput(call_to_emit);
       }
 
-      std::vector<Var> new_remapped_vars;
       // Step c. Update the mapping used for the remapping of the binding variables.
       if (IsTupleOutput(func_info.function_)) {
         // If the output is a tuple, attach TupleGetItem to all tuple elements, and
@@ -742,28 +696,10 @@ class OperatorFusor : public ExprMutator {
         for (const auto& var : pending_tuple_get[group]) {
           auto tuple_get = TupleGetItem(new_var, tuple_get_indices_[var.get()]);
           var_remap_[var->vid] = builder_->Emit(tuple_get);
-          vars_pending_remap.erase(var.get());
-          new_remapped_vars.push_back(var);
         }
       } else {
         var_remap_[var_binding->var->vid] = new_var;
-        vars_pending_remap.erase(var_binding->var.get());
-        new_remapped_vars.push_back(var_binding->var);
       }
-
-      std::unordered_map<const BindingNode*, VarSet> next;
-      for (auto& [binding, unremapped_vars] : pending_tuple_get_bindings) {
-        for (auto new_var : new_remapped_vars) {
-          unremapped_vars.erase(new_var.get());
-        }
-
-        if (unremapped_vars.empty()) {
-          pending_bindings.push_front(GetRef<Binding>(binding));
-        } else {
-          next.emplace(binding, unremapped_vars);
-        }
-      }
-      std::swap(pending_tuple_get_bindings, next);
     }
 
     // Step 5. Finish the binding block generation.
@@ -870,6 +806,41 @@ class OperatorFusor : public ExprMutator {
   }
 
  private:
+  Array<Binding> TopoSortByGroupDep(const Array<Binding>& bindings) {
+    std::unordered_map<Group*, std::vector<Binding>> bindings_per_group;
+    std::vector<Group*> group_order;
+    for (const auto& binding : bindings) {
+      auto g = GetGroupFromBinding(binding);
+      bindings_per_group[g].push_back(binding);
+      group_order.push_back(g);  // Duplication does not matter.
+    }
+
+    std::unordered_set<Group*> visited;
+
+    std::function<void(Group*, std::function<void(Group*)>)> dfs_visit;
+    dfs_visit = [this, &visited, &dfs_visit](Group* g, auto leaf_fun) {
+      if (!visited.count(g)) {
+        visited.insert(g);
+        for (auto dep : group_deps_[g]) {
+          dfs_visit(dep, leaf_fun);
+        }
+        leaf_fun(g);
+      }
+    };
+
+    Array<Binding> sorted;
+
+    for (auto g : group_order) {
+      dfs_visit(g, [&sorted, &bindings_per_group](Group* leaf) {
+        for (const auto& binding : bindings_per_group[leaf]) {
+          sorted.push_back(binding);
+        }
+      });
+    }
+
+    return sorted;
+  }
+
   /*! \brief The IRModule. */
   IRModule mod_;
   /*! \brief Internal arena. */
