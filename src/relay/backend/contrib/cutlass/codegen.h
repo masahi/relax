@@ -27,10 +27,61 @@
 
 #include <tvm/ir/transform.h>
 
+#include "../codegen_c/codegen_c.h"
+
 namespace tvm {
 namespace relay {
 namespace contrib {
 namespace cutlass {
+
+using Str2StrMap = std::unordered_map<std::string, std::string>;
+
+inline void CutlassPrint(std::ostringstream& os, const std::string& stmt, int indent = 2) {
+  for (int i = 0; i < indent; ++i) {
+    os << " ";
+  }
+  os << stmt;
+}
+
+std::string GetDimAsStr(ObjectRef dim);
+
+Str2StrMap ArgsCommon(const Map<String, ObjectRef>& attrs);
+
+Str2StrMap GemmArgsCommon(const Map<String, ObjectRef>& attrs);
+
+Str2StrMap DenseArgs(const Map<String, ObjectRef>& attrs);
+
+Str2StrMap BatchMatmulArgs(const Map<String, ObjectRef>& attrs);
+
+void AppendPrologue(std::ostringstream& gemm_decl, const Str2StrMap& attrs,
+                    const std::vector<std::string>& func_args, const std::string& kernel,
+                    bool has_bias, bool is_gelu, int m_axis_idx, int n_axis_idx, int k_axis_idx);
+
+void AppendGemmExecute(std::ostringstream& gemm_decl, const std::string& kernel);
+
+std::string DenseOp(std::string id, const Str2StrMap& attrs,
+                    const std::vector<std::string>& func_args);
+
+std::string BatchMatmulOp(std::string id, const Str2StrMap& attrs,
+                          const std::vector<std::string>& func_args);
+
+Str2StrMap Conv2dArgs(const Map<String, ObjectRef>& attrs, bool is_dgrad = false,
+                      bool is_wgrad = false);
+
+std::string Conv2dOp(std::string id, const Str2StrMap& attrs,
+                     const std::vector<std::string>& func_args, bool has_residual_block = false);
+
+std::string EmitHeaders();
+
+std::string EmitSignature(const std::vector<relay::contrib::Output>& out,
+                          const std::string& func_id, const std::vector<std::string>& arg_names);
+
+GenerateBodyOutput GenerateBody(const std::string& func_name, const std::string& ext_func_id,
+                                const std::vector<std::string>& func_args,
+                                const std::vector<std::string>& output_types,
+                                const Str2StrMap& attribute_args, int* buf_idx);
+
+runtime::Module Finalize(const std::string& code, const Array<String>& func_names);
 
 /*!
  * \brief Returns the pass which replaces all calls to "Primitive" functions with "Compiler"

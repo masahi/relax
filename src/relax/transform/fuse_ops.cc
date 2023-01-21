@@ -35,8 +35,12 @@
 #include <tvm/relax/transform.h>
 #include <tvm/tir/function.h>
 
+#include <deque>
+#include <unordered_set>
+
 #include "../../relay/analysis/graph_partitioner.h"
 #include "../../support/arena.h"
+#include "../backend/contrib/utils.h"
 
 namespace tvm {
 namespace relax {
@@ -385,9 +389,12 @@ class FunctionCreator : public ExprMutator {
           }
           // TODO(tvm-team): handle shape expr
         } else {
-          ICHECK(call->op->IsInstance<OpNode>()) << "Only support relax.call_tir or high-level "
-                                                    "operators as the callee op for CallNode.";
-          name_hint_ = name_hint_ + "_" + Downcast<Op>(call->op)->name;
+          if (call->op->IsInstance<OpNode>()) {
+            name_hint_ = name_hint_ + "_" + Downcast<Op>(call->op)->name;
+          } else if (call->op->IsInstance<GlobalVarNode>()) {
+            name_hint_ = name_hint_ + "_" + Downcast<GlobalVar>(call->op)->name_hint;
+          }
+
           for (const Expr& arg : call->args) {
             CheckDefAndUpdateParam(arg);
           }
@@ -552,6 +559,8 @@ class OperatorFusor : public ExprMutator {
  public:
   using Group = GraphPartitioner::Group;
   using GroupMap = std::unordered_map<const Object*, Group*>;
+  using VarSet = std::unordered_set<const VarNode*>;
+
   /*!
    * \brief Construct a new operator fusor. Given the indexed-forward graph and the graph partition
    * result on that graph, the constructor creates a mapping from each leaf AST object
@@ -562,8 +571,11 @@ class OperatorFusor : public ExprMutator {
    * \param groups The grouped result of the group partition on the input indexed-forward graph.
    */
   explicit OperatorFusor(IRModule mod, const IndexedForwardGraph& graph,
-                         const std::vector<Group*>& groups)
-      : ExprMutator(mod), mod_(std::move(mod)) {
+                         const std::vector<Group*>& groups,
+                         bool create_single_binding_function = false)
+      : ExprMutator(mod),
+        mod_(std::move(mod)),
+        create_single_binding_function_(create_single_binding_function) {
     for (int nid = 0; nid < static_cast<int>(graph.post_dfs_order.size()); ++nid) {
       Group* group_root = groups[nid]->FindRoot();
       ICHECK(group_root != nullptr);
@@ -572,8 +584,12 @@ class OperatorFusor : public ExprMutator {
     }
   }
 
-  OperatorFusor(IRModule mod, const GroupMap& obj2group)
-      : ExprMutator(mod), mod_(std::move(mod)), obj2group_(obj2group) {}
+  OperatorFusor(IRModule mod, const GroupMap& obj2group,
+                bool create_single_binding_function = false)
+      : ExprMutator(mod),
+        mod_(std::move(mod)),
+        obj2group_(obj2group),
+        create_single_binding_function_(create_single_binding_function) {}
 
   /*!
    * \brief The main transformation on the IRModule
@@ -630,14 +646,34 @@ class OperatorFusor : public ExprMutator {
     // For each group, record which variables need to be remapped to the output of TupleGetItem.
     // Only relevant when the output of the grouped function is a tuple.
     std::unordered_map<Group*, std::vector<Var>> pending_tuple_get;
+    std::unordered_map<const BindingNode*, VarSet> pending_tuple_get_bindings;
+    VarSet vars_pending_remap;
+    std::deque<Binding> pending_bindings;
 
-    for (size_t i = 0; i < block->bindings.size(); ++i) {
-      const Binding& binding = block->bindings[i];
+    for (auto entry : tuple_get_indices_) {
+      auto var = entry.first;
+      Group* group = GetGroupFromVar(GetRef<Var>(var));
+      const auto& it_creator = group2func_.find(group);
+      ICHECK(it_creator != group2func_.end());
+      const FunctionCreator& func_info = it_creator->second;
+
+      if (IsTupleOutput(func_info.function_)) {
+        vars_pending_remap.insert(var);
+      }
+    }
+
+    for (auto binding : block->bindings) {
+      pending_bindings.push_back(binding);
+    }
+
+    while (!pending_bindings.empty()) {
+      Binding binding = pending_bindings.front();
+      pending_bindings.pop_front();
 
       // Case 1. If the binding is the only binding in its group, recurse into it and emit the
       // transformed binding as usual.
       Group* group = GetGroupFromBinding(binding);
-      if (group->num_nodes == 1) {
+      if (group->num_nodes == 1 && !create_single_binding_function_) {
         VisitBinding(binding);
         continue;
       }
@@ -651,6 +687,25 @@ class OperatorFusor : public ExprMutator {
       // emitted.
       if (IsTupleOutput(func_info.function_) && tuple_get_indices_.count(binding->var.get())) {
         pending_tuple_get[group].push_back(binding->var);
+      } else {
+        if (const auto* var_binding = binding.as<VarBindingNode>()) {
+          VarSet unremapped_vars;
+          PostOrderVisit(var_binding->value,
+                         [&unremapped_vars, &vars_pending_remap](const Expr& e) {
+                           if (e->IsInstance<VarNode>()) {
+                             auto used_var = Downcast<Var>(e);
+                             if (vars_pending_remap.count(used_var.get())) {
+                               unremapped_vars.insert(used_var.get());
+                             }
+                           }
+                         });
+
+          if (!unremapped_vars.empty()) {
+            pending_tuple_get_bindings[binding.get()] = unremapped_vars;
+            vars_pending_remap.insert(binding->var.get());
+            continue;
+          }
+        }
       }
 
       // Case 2. If the binding is not the last binding of the group, we skip it.
@@ -678,6 +733,7 @@ class OperatorFusor : public ExprMutator {
         new_var = builder_->EmitOutput(call_to_emit);
       }
 
+      std::vector<Var> new_remapped_vars;
       // Step c. Update the mapping used for the remapping of the binding variables.
       if (IsTupleOutput(func_info.function_)) {
         // If the output is a tuple, attach TupleGetItem to all tuple elements, and
@@ -687,11 +743,30 @@ class OperatorFusor : public ExprMutator {
         for (const auto& var : pending_tuple_get[group]) {
           auto tuple_get = TupleGetItem(new_var, tuple_get_indices_[var.get()]);
           var_remap_[var->vid] = builder_->Emit(tuple_get);
+          vars_pending_remap.erase(var.get());
+          new_remapped_vars.push_back(var);
         }
       } else {
         var_remap_[var_binding->var->vid] = new_var;
+        vars_pending_remap.erase(var_binding->var.get());
+        new_remapped_vars.push_back(var_binding->var);
       }
+
+      std::unordered_map<const BindingNode*, VarSet> next;
+      for (auto& [binding, unremapped_vars] : pending_tuple_get_bindings) {
+        for (auto new_var : new_remapped_vars) {
+          unremapped_vars.erase(new_var.get());
+        }
+
+        if (unremapped_vars.empty()) {
+          pending_bindings.push_front(GetRef<Binding>(binding));
+        } else {
+          next.emplace(binding, unremapped_vars);
+        }
+      }
+      std::swap(pending_tuple_get_bindings, next);
     }
+
     // Step 5. Finish the binding block generation.
     return builder_->EndBlock();
   }
@@ -706,7 +781,7 @@ class OperatorFusor : public ExprMutator {
     for (const Binding& binding : bindings) {
       // If the binding is the only binding in its group, there is no need to create a new function.
       Group* group = GetGroupFromBinding(binding);
-      if (group->num_nodes == 1) {
+      if (group->num_nodes == 1 && !create_single_binding_function_) {
         continue;
       }
       // Add the binding to the grouped function it's in, and update the function information
@@ -809,6 +884,8 @@ class OperatorFusor : public ExprMutator {
   std::unordered_map<const VarNode*, int> tuple_get_indices_;
   /*! \brief A map from a group to its dependent groups, used to detect cyclic dependencies. */
   std::unordered_map<Group*, std::unordered_set<Group*>> group_deps_;
+  /*! \brief Whether or not a grouped function with a single binding should be created. */
+  bool create_single_binding_function_{false};
 };
 
 IRModule FuseOps(IRModule mod, int opt_level, size_t max_fuse_depth) {
@@ -938,6 +1015,228 @@ IRModule FuseOpsByPattern(const tvm::Array<String>& pattern_names,
   return mod;
 }
 
+namespace {
+
+String GetCodegenName(const std::string& composite_name) {
+  auto delim_pos = composite_name.find(".");
+  ICHECK(delim_pos != std::string::npos) << "The pattern name for a composite function should "
+                                            "start with a compiler name followed by period.";
+  return composite_name.substr(0, delim_pos);
+}
+
+struct CompositeGroup {
+  GraphPartitioner::Group* representative;
+  std::string target;
+};
+
+class BuildCompositeGroups : public backend::MemoizedExprTranslator<CompositeGroup> {
+ public:
+  using Group = GraphPartitioner::Group;
+  BuildCompositeGroups(IRModule mod, support::Arena* arena)
+      : mod_(mod), arena_(arena), default_group_(CompositeGroup{nullptr, kDefaultTarget}) {}
+
+  OperatorFusor::GroupMap Run(Function func) {
+    for (const auto& param : func->params) {
+      memo_[param] = CompositeGroup{nullptr, kAny};
+    }
+    VisitExpr(func->body);
+
+    OperatorFusor::GroupMap group_map;
+    for (const auto& [expr, group] : memo_) {
+      if (group.representative) {
+        group_map[expr.get()] = group.representative;
+      } else {
+        group_map[expr.get()] = arena_->make<GraphPartitioner::Group>();
+      }
+    }
+
+    return group_map;
+  }
+
+  CompositeGroup VisitBinding_(const VarBindingNode* binding) {
+    ICHECK_EQ(memo_.count(binding->var), 0);
+    auto v = VisitExpr(binding->value);
+    memo_[binding->var] = v;
+    return v;
+  }
+
+  CompositeGroup VisitBinding(const Binding& binding) {
+    if (const auto* node = binding.as<VarBindingNode>()) {
+      return VisitBinding_(node);
+    } else {
+      LOG(FATAL) << "TypeError: Invalid type: " << binding->GetTypeKey();
+    }
+  }
+
+  CompositeGroup VisitBindingBlock_(const BindingBlockNode* block) {
+    for (Binding binding : block->bindings) {
+      VisitBinding(binding);
+    }
+    return default_group_;
+  }
+
+  CompositeGroup VisitBindingBlock_(const DataflowBlockNode* block) {
+    for (Binding binding : block->bindings) {
+      VisitBinding(binding);
+    }
+    return CompositeGroup{nullptr, kAny};
+  }
+
+  CompositeGroup VisitBindingBlock(const BindingBlock& block) {
+    if (const auto* node = block.as<DataflowBlockNode>()) {
+      return VisitBindingBlock_(node);
+    } else if (const auto* node = block.as<BindingBlockNode>()) {
+      return VisitBindingBlock_(node);
+    } else {
+      LOG(FATAL) << "TypeError: Invalid type: " << block->GetTypeKey();
+    }
+  }
+
+  CompositeGroup VisitExpr_(const SeqExprNode* op) {
+    for (BindingBlock block : op->blocks) {
+      VisitBindingBlock(block);
+    }
+    return VisitExpr(op->body);
+  }
+
+  CompositeGroup VisitExpr_(const VarNode* vn) {
+    ICHECK(memo_.count(GetRef<Expr>(vn)));
+    return memo_[GetRef<Expr>(vn)];
+  }
+
+  CompositeGroup VisitExpr_(const CallNode* call) {
+    auto const* gvar = call->op.as<GlobalVarNode>();
+    if (!gvar) {
+      return default_group_;
+    }
+
+    auto composite_name_opt =
+        mod_->Lookup(GetRef<GlobalVar>(gvar))->GetAttr<String>(attr::kComposite);
+    if (!composite_name_opt) {
+      return default_group_;
+    }
+
+    std::string composite_name = GetCodegenName(composite_name_opt.value());
+
+    auto rep_group = GetRepresentative(call->args, composite_name);
+
+    if (rep_group->num_nodes != 0) {
+      for (const auto& arg : call->args) {
+        auto& arg_group = memo_[arg];
+        if (arg_group.target == composite_name && arg_group.representative != rep_group) {
+          rep_group->num_nodes += arg_group.representative->num_nodes;
+          arg_group.representative->num_nodes = 0;
+          arg_group.representative = rep_group;
+        }
+      }
+    }
+
+    ++rep_group->num_nodes;
+    return CompositeGroup{rep_group, composite_name};
+  }
+
+ private:
+  Group* GetRepresentative(const Array<Expr>& args, const std::string& composite_name) {
+    Group* rep = nullptr;
+    std::unordered_set<Group*> parent_deps;
+
+    for (const auto& arg : args) {
+      for (auto parent_dep : group_deps_[memo_[arg].representative]) {
+        parent_deps.insert(parent_dep);
+      }
+    }
+
+    for (const auto& arg : args) {
+      auto arg_group = memo_[arg];
+      if (arg_group.target == composite_name && !parent_deps.count(arg_group.representative)) {
+        rep = arg_group.representative;
+      }
+    }
+
+    if (rep == nullptr) {
+      rep = arena_->make<Group>();
+      rep->num_nodes = 0;
+    }
+
+    for (const auto& arg : args) {
+      auto arg_group = memo_[arg];
+      if (arg_group.target != composite_name) {
+        group_deps_[rep].insert(arg_group.representative);
+      }
+    }
+
+    for (auto parent_dep : parent_deps) {
+      group_deps_[rep].insert(parent_dep);
+    }
+
+    return rep;
+  }
+
+  const std::string kDefaultTarget = "default";
+  const std::string kAny = "any";
+  IRModule mod_;
+  support::Arena* arena_;
+  CompositeGroup default_group_;
+  std::unordered_map<Group*, std::unordered_set<Group*>> group_deps_;
+};
+
+class InlineComposite : public ExprMutator {
+ public:
+  explicit InlineComposite(IRModule mod) : ExprMutator(mod), mod_(mod) {}
+  using ExprMutator::VisitExpr_;
+
+  Function Run(Function func) {
+    target_name_ = "";
+    auto new_body = VisitExpr(func->body);
+    ICHECK(!target_name_.empty());
+    return WithAttr(
+        Function(func->params, new_body, func->ret_struct_info, func->attrs, func->span),
+        attr::kCodegen, target_name_);
+  }
+
+  Expr VisitExpr_(const CallNode* call) {
+    if (call->op->IsInstance<GlobalVarNode>()) {
+      auto gvar = Downcast<GlobalVar>(call->op);
+      auto func = Downcast<Function>(mod_->Lookup(gvar));
+      auto composite_name_opt = func->GetAttr<String>(attr::kComposite);
+      ICHECK(composite_name_opt);
+      std::string composite_name = composite_name_opt.value();
+      auto tgt_name = GetCodegenName(composite_name);
+      if (!target_name_.empty()) {
+        ICHECK(tgt_name == target_name_);
+      } else {
+        target_name_ = tgt_name;
+      }
+      return Call(func, call->args);
+    }
+    return ExprMutator::VisitExpr_(call);
+  }
+
+ private:
+  IRModule mod_;
+  String target_name_;
+};
+
+}  // namespace
+
+IRModule FuseCompositeFunctions(IRModule mod) {
+  auto gvar = mod->GetGlobalVar("main");
+  auto func = Downcast<Function>(mod->Lookup(gvar));
+  support::Arena arena;
+  auto group_map = BuildCompositeGroups(mod, &arena).Run(func);
+  auto new_mod = OperatorFusor(mod, group_map, true).Transform();
+
+  InlineComposite postproc(mod);
+  for (const auto& [gvar, func] : new_mod->functions) {
+    if (!mod->functions.count(gvar)) {
+      auto new_func = postproc.Run(Downcast<Function>(func));
+      new_mod->Update(gvar, WithAttr(new_func, tvm::attr::kGlobalSymbol, gvar->name_hint));
+    }
+  }
+
+  return RemoveUnusedFunctions(new_mod, {"main"});
+}
+
 namespace transform {
 
 Pass FuseOps(int fuse_opt_level) {
@@ -968,6 +1267,18 @@ Pass FuseOpsByPattern(const tvm::Array<String>& pattern_names,
 }
 
 TVM_REGISTER_GLOBAL("relax.transform.FuseOpsByPattern").set_body_typed(FuseOpsByPattern);
+
+Pass FuseCompositeFunctions() {
+  runtime::TypedPackedFunc<IRModule(IRModule, PassContext)> pass_func =  //
+      [=](IRModule mod, PassContext pc) { return relax::FuseCompositeFunctions(mod); };
+  return CreateModulePass(/*pass_function=*/pass_func,       //
+                          /*opt_level=*/0,                   //
+                          /*pass_name=*/"FuseOpsByPattern",  //
+                          /*required=*/{});
+}
+
+TVM_REGISTER_GLOBAL("relax.transform.FuseCompositeFunctions")
+    .set_body_typed(FuseCompositeFunctions);
 
 }  // namespace transform
 
