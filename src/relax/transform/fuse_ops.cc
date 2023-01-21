@@ -35,6 +35,9 @@
 #include <tvm/relax/transform.h>
 #include <tvm/tir/function.h>
 
+#include <deque>
+#include <unordered_set>
+
 #include "../../relay/analysis/graph_partitioner.h"
 #include "../../support/arena.h"
 #include "../backend/contrib/utils.h"
@@ -556,6 +559,8 @@ class OperatorFusor : public ExprMutator {
  public:
   using Group = GraphPartitioner::Group;
   using GroupMap = std::unordered_map<const Object*, Group*>;
+  using VarSet = std::unordered_set<const VarNode*>;
+
   /*!
    * \brief Construct a new operator fusor. Given the indexed-forward graph and the graph partition
    * result on that graph, the constructor creates a mapping from each leaf AST object
@@ -566,8 +571,11 @@ class OperatorFusor : public ExprMutator {
    * \param groups The grouped result of the group partition on the input indexed-forward graph.
    */
   explicit OperatorFusor(IRModule mod, const IndexedForwardGraph& graph,
-                         const std::vector<Group*>& groups)
-      : ExprMutator(mod), mod_(std::move(mod)) {
+                         const std::vector<Group*>& groups,
+                         bool create_single_binding_function = false)
+      : ExprMutator(mod),
+        mod_(std::move(mod)),
+        create_single_binding_function_(create_single_binding_function) {
     for (int nid = 0; nid < static_cast<int>(graph.post_dfs_order.size()); ++nid) {
       Group* group_root = groups[nid]->FindRoot();
       ICHECK(group_root != nullptr);
@@ -576,8 +584,12 @@ class OperatorFusor : public ExprMutator {
     }
   }
 
-  OperatorFusor(IRModule mod, const GroupMap& obj2group)
-      : ExprMutator(mod), mod_(std::move(mod)), obj2group_(obj2group) {}
+  OperatorFusor(IRModule mod, const GroupMap& obj2group,
+                bool create_single_binding_function = false)
+      : ExprMutator(mod),
+        mod_(std::move(mod)),
+        obj2group_(obj2group),
+        create_single_binding_function_(create_single_binding_function) {}
 
   /*!
    * \brief The main transformation on the IRModule
@@ -634,14 +646,34 @@ class OperatorFusor : public ExprMutator {
     // For each group, record which variables need to be remapped to the output of TupleGetItem.
     // Only relevant when the output of the grouped function is a tuple.
     std::unordered_map<Group*, std::vector<Var>> pending_tuple_get;
+    std::unordered_map<const BindingNode*, VarSet> pending_tuple_get_bindings;
+    VarSet vars_pending_remap;
+    std::deque<Binding> pending_bindings;
 
-    for (size_t i = 0; i < block->bindings.size(); ++i) {
-      const Binding& binding = block->bindings[i];
+    for (auto entry : tuple_get_indices_) {
+      auto var = entry.first;
+      Group* group = GetGroupFromVar(GetRef<Var>(var));
+      const auto& it_creator = group2func_.find(group);
+      ICHECK(it_creator != group2func_.end());
+      const FunctionCreator& func_info = it_creator->second;
+
+      if (IsTupleOutput(func_info.function_)) {
+        vars_pending_remap.insert(var);
+      }
+    }
+
+    for (auto binding : block->bindings) {
+      pending_bindings.push_back(binding);
+    }
+
+    while (!pending_bindings.empty()) {
+      Binding binding = pending_bindings.front();
+      pending_bindings.pop_front();
 
       // Case 1. If the binding is the only binding in its group, recurse into it and emit the
       // transformed binding as usual.
       Group* group = GetGroupFromBinding(binding);
-      if (group->num_nodes == 1) {
+      if (group->num_nodes == 1 && !create_single_binding_function_) {
         VisitBinding(binding);
         continue;
       }
@@ -655,6 +687,25 @@ class OperatorFusor : public ExprMutator {
       // emitted.
       if (IsTupleOutput(func_info.function_) && tuple_get_indices_.count(binding->var.get())) {
         pending_tuple_get[group].push_back(binding->var);
+      } else {
+        if (const auto* var_binding = binding.as<VarBindingNode>()) {
+          VarSet unremapped_vars;
+          PostOrderVisit(var_binding->value,
+                         [&unremapped_vars, &vars_pending_remap](const Expr& e) {
+                           if (e->IsInstance<VarNode>()) {
+                             auto used_var = Downcast<Var>(e);
+                             if (vars_pending_remap.count(used_var.get())) {
+                               unremapped_vars.insert(used_var.get());
+                             }
+                           }
+                         });
+
+          if (!unremapped_vars.empty()) {
+            pending_tuple_get_bindings[binding.get()] = unremapped_vars;
+            vars_pending_remap.insert(binding->var.get());
+            continue;
+          }
+        }
       }
 
       // Case 2. If the binding is not the last binding of the group, we skip it.
@@ -682,6 +733,7 @@ class OperatorFusor : public ExprMutator {
         new_var = builder_->EmitOutput(call_to_emit);
       }
 
+      std::vector<Var> new_remapped_vars;
       // Step c. Update the mapping used for the remapping of the binding variables.
       if (IsTupleOutput(func_info.function_)) {
         // If the output is a tuple, attach TupleGetItem to all tuple elements, and
@@ -691,11 +743,30 @@ class OperatorFusor : public ExprMutator {
         for (const auto& var : pending_tuple_get[group]) {
           auto tuple_get = TupleGetItem(new_var, tuple_get_indices_[var.get()]);
           var_remap_[var->vid] = builder_->Emit(tuple_get);
+          vars_pending_remap.erase(var.get());
+          new_remapped_vars.push_back(var);
         }
       } else {
         var_remap_[var_binding->var->vid] = new_var;
+        vars_pending_remap.erase(var_binding->var.get());
+        new_remapped_vars.push_back(var_binding->var);
       }
+
+      std::unordered_map<const BindingNode*, VarSet> next;
+      for (auto& [binding, unremapped_vars] : pending_tuple_get_bindings) {
+        for (auto new_var : new_remapped_vars) {
+          unremapped_vars.erase(new_var.get());
+        }
+
+        if (unremapped_vars.empty()) {
+          pending_bindings.push_front(GetRef<Binding>(binding));
+        } else {
+          next.emplace(binding, unremapped_vars);
+        }
+      }
+      std::swap(pending_tuple_get_bindings, next);
     }
+
     // Step 5. Finish the binding block generation.
     return builder_->EndBlock();
   }
@@ -710,7 +781,7 @@ class OperatorFusor : public ExprMutator {
     for (const Binding& binding : bindings) {
       // If the binding is the only binding in its group, there is no need to create a new function.
       Group* group = GetGroupFromBinding(binding);
-      if (group->num_nodes == 1) {
+      if (group->num_nodes == 1 && !create_single_binding_function_) {
         continue;
       }
       // Add the binding to the grouped function it's in, and update the function information
@@ -813,6 +884,8 @@ class OperatorFusor : public ExprMutator {
   std::unordered_map<const VarNode*, int> tuple_get_indices_;
   /*! \brief A map from a group to its dependent groups, used to detect cyclic dependencies. */
   std::unordered_map<Group*, std::unordered_set<Group*>> group_deps_;
+  /*! \brief Whether or not a grouped function with a single binding should be created. */
+  bool create_single_binding_function_{false};
 };
 
 IRModule FuseOps(IRModule mod, int opt_level, size_t max_fuse_depth) {
@@ -984,7 +1057,6 @@ class BuildCompositeGroups : public backend::MemoizedExprTranslator<CompositeGro
     ICHECK_EQ(memo_.count(binding->var), 0);
     auto v = VisitExpr(binding->value);
     memo_[binding->var] = v;
-    LOG(INFO) << binding->var->name_hint() << ", " << binding->value << ", " << v.representative;
     return v;
   }
 
@@ -1066,7 +1138,6 @@ class BuildCompositeGroups : public backend::MemoizedExprTranslator<CompositeGro
  private:
   Group* GetRepresentative(const Array<Expr>& args, const std::string& composite_name) {
     Group* rep = nullptr;
-
     std::unordered_set<Group*> parent_deps;
 
     for (const auto& arg : args) {
@@ -1153,7 +1224,7 @@ IRModule FuseCompositeFunctions(IRModule mod) {
   auto func = Downcast<Function>(mod->Lookup(gvar));
   support::Arena arena;
   auto group_map = BuildCompositeGroups(mod, &arena).Run(func);
-  auto new_mod = OperatorFusor(mod, group_map).Transform();
+  auto new_mod = OperatorFusor(mod, group_map, true).Transform();
 
   InlineComposite postproc(mod);
   for (const auto& [gvar, func] : new_mod->functions) {
