@@ -145,9 +145,7 @@ class TensorRTJSONSerializer : public JSONSerializer {
     for (const auto& node : collector.args_) {
       inputs.emplace_back(node);
     }
-    // TODO(@sunggg): Revisit when we have op naming convention.
-    // Currently, simply remove "relax." prefix to make it work.
-    name = std::string("tensorrt.") + name.substr(6);
+
     // Create the final node.
     auto node = std::make_shared<JSONGraphNode>(name,
                                                 /*op_type=*/"kernel", inputs,

@@ -81,8 +81,8 @@ def test_tensorrt_offload():
     add_pat = is_op("relax.add")(wildcard(), wildcard())
 
     patterns = [
-        ("tensorrt.conv2d", conv_pat),
-        ("tensorrt.relu", relu_pat),
+        ("tensorrt.nn.conv2d", conv_pat),
+        ("tensorrt.nn.relu", relu_pat),
         ("tensorrt.add", add_pat),
     ]
 
