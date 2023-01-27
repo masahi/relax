@@ -122,17 +122,17 @@ class TensorRTJSONSerializer : public JSONSerializer {
 
   std::vector<JSONGraphNodeEntry> VisitExpr_(const CallNode* call_node) final {
     // The call must be to an inline "Composite" function
-    const auto* function_node = call_node->op.as<FunctionNode>();
-    // ICHECK(function_node != nullptr);
-    if (!function_node) return JSONSerializer::VisitExpr_(call_node);
+    const auto* fn_var = call_node->op.as<VarNode>();
+    ICHECK(fn_var);
+    const auto fn = Downcast<Function>(bindings_[GetRef<Var>(fn_var)]);
 
-    auto opt_composite = function_node->GetAttr<String>(attr::kComposite);
+    auto opt_composite = fn->GetAttr<String>(attr::kComposite);
     ICHECK(opt_composite.defined());
     std::string name = opt_composite.value();
 
     // Collect the constants and attributes of all operator calls inside the composite body.
     CollectFromCompositeFunctionBody collector(this);
-    collector.VisitExpr(function_node->body);
+    collector.VisitExpr(fn->body);
 
     // Capture the args to the "Composite" function as inputs for this node.
     std::vector<JSONGraphNodeEntry> inputs;
@@ -192,6 +192,10 @@ class TensorRTJSONSerializer : public JSONSerializer {
     node->SetAttr("use_fp16", use_fp16_attr);
     node->SetAttr("use_uint8", use_uint8_attr);
   }
+
+ private:
+  /*! \brief The bindings to look up composite functions. */
+  Map<Var, Expr> bindings_;
 };
 
 void CollectFromCompositeFunctionBody::VisitExpr_(const ConstantNode* constant_node) {

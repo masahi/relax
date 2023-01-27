@@ -78,17 +78,19 @@ def test_tensorrt_offload():
         "relax.nn.conv2d", with_bias=False, activation=None
     )
     relu_pat = is_op("relax.nn.relu")(wildcard())
+    add_pat = is_op("relax.add")(wildcard(), wildcard())
 
     patterns = [
         ("tensorrt.conv2d", conv_pat),
-        ("tensorrt.relu", relu_pat)
+        ("tensorrt.relu", relu_pat),
+        ("tensorrt.add", add_pat),
     ]
 
     seq = tvm.transform.Sequential(
         [
             relax.transform.FuseOpsByPattern(patterns),
             relax.transform.MergeCompositeFunctions(),
-            # relax.transform.RunCodegen(),
+            relax.transform.RunCodegen(),
         ]
     )
 
@@ -96,16 +98,19 @@ def test_tensorrt_offload():
 
     print(mod.script())
 
-    # target = tvm.target.Target("cuda")
-    # ex = relax.vm.build(mod, target)
+    target = "cuda"
+    dev = tvm.device(target, 0)
+    ex = relax.vm.build(mod, target)
 
-    # vm = relax.VirtualMachine(ex, tvm.gpu(0))
-    # f = vm["main"]
+    vm = relax.VirtualMachine(ex, dev)
+    f = vm["main"]
 
-    # data_np = np.random.randn(1, 64, 56, 56).astype("float32")
-    # weight1_np = np.random.randn(64, 64, 3, 3).astype("float32")
-    # weight2_np = np.random.randn(64, 64, 3, 3).astype("float32")
-    # out = f(tvm.nd.array(data_np), tvm.nd.array(weight1_np), tvm.nd.array(weight2_np)).numpy()
+    data_np = np.random.randn(1, 64, 56, 56).astype("float32")
+    weight1_np = np.random.randn(64, 64, 3, 3).astype("float32")
+    weight2_np = np.random.randn(64, 64, 3, 3).astype("float32")
+    out = f(
+        tvm.nd.array(data_np, dev), tvm.nd.array(weight1_np, dev), tvm.nd.array(weight2_np, dev)
+    ).numpy()
 
     # relay_mod = tvm.IRModule.from_expr(get_relay_conv2d_relu_x2(data_np.shape, weight1_np.shape))
 
