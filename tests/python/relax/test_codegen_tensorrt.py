@@ -47,7 +47,7 @@ def get_relay_conv2d_relu_x2(d_shape, w_shape):
 
 
 @tvm.script.ir_module
-class Conv2dReLUx2:
+class Conv2dResidualBlock:
     @R.function
     def main(
         data: R.Tensor((1, 64, 56, 56), "float32"),
@@ -56,10 +56,11 @@ class Conv2dReLUx2:
     ):
         with R.dataflow():
             conv1 = relax.op.nn.relu(relax.op.nn.conv2d(data, weight1, padding=(1, 1)))
-            conv2d = relax.op.nn.relu(relax.op.nn.conv2d(conv1, weight2, padding=(0, 0)))
-            R.output(conv2d)
+            conv2 = relax.op.nn.relu(relax.op.nn.conv2d(conv1, weight2, padding=(1, 1)))
+            out = relax.op.add(conv2, data)
+            R.output(out)
 
-        return conv2d
+        return out
 
 
 has_tensorrt = tvm.get_global_func("relax.ext.tensorrt", True)
@@ -76,7 +77,7 @@ def test_tensorrt_offload():
     conv_pat = make_fused_bias_activation_pattern(
         "relax.nn.conv2d", with_bias=False, activation=None
     )
-    relu_pat = is_op("relax.nn.relu")(wildcard(), wildcard())
+    relu_pat = is_op("relax.nn.relu")(wildcard())
 
     patterns = [
         ("tensorrt.conv2d", conv_pat),
@@ -91,7 +92,7 @@ def test_tensorrt_offload():
         ]
     )
 
-    mod = seq(Conv2dReLUx2)
+    mod = seq(Conv2dResidualBlock)
 
     print(mod.script())
 
