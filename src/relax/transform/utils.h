@@ -107,14 +107,11 @@ inline std::string GetExtSymbol(const Function& func) {
  *
  * \param mod The input module.
  * \param partition A mapping from a subexpression to the containing group.
- * \param create_single_binding_function Whether or not to create a grouped function for a group
- *  containing a single binding.
  * \return A new module containing grouped functions.
  */
 IRModule MakeGroupedFunctions(
     IRModule mod,
-    const std::unordered_map<const Object*, relay::GraphPartitioner::Group*>& partition,
-    bool create_single_binding_function = false);
+    const std::unordered_map<const Object*, relay::GraphPartitioner::Group*>& partition);
 
 }  // namespace relax
 }  // namespace tvm

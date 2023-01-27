@@ -435,7 +435,7 @@ class FunctionCreator : public ExprMutator {
    * It will become the value of the kComposite attribute of the created function.
    * \note The created function won't be returned immediately. It's stored in the `function_` field.
    */
-  void CreateFunction(std::optional<std::string> composite_name) {
+  void CreateFunction(Map<String, ObjectRef> group_attrs) {
     // Step 1. Start constructing a new dataflow block.
     builder_->BeginDataflowBlock();
 
@@ -462,15 +462,11 @@ class FunctionCreator : public ExprMutator {
     Expr body = outputs.size() == 1 ? outputs[0] : Tuple(outputs);
     body = builder_->Normalize(body);
     body = builder_->Normalize(SeqExpr({new_block}, body));
-    Map<String, ObjectRef> attrs;
-    attrs.Set(tvm::relax::attr::kPrimitive, Integer(1));
-    if (composite_name) {
-      attrs.Set(tvm::relax::attr::kComposite, String(*composite_name));
-    }
+    group_attrs.Set(tvm::relax::attr::kPrimitive, Integer(1));
     function_ = Function(/*params=*/params_,           //
                          /*body=*/body,                //
                          /*ret_struct_info=*/NullOpt,  //
-                         /*attrs=*/DictAttrs(attrs));
+                         /*attrs=*/DictAttrs(group_attrs));
   }
 
   /*! \brief The original bindings of the function */
@@ -570,11 +566,8 @@ class OperatorFusor : public ExprMutator {
    * \param groups The grouped result of the group partition on the input indexed-forward graph.
    */
   explicit OperatorFusor(IRModule mod, const IndexedForwardGraph& graph,
-                         const std::vector<Group*>& groups,
-                         bool create_single_binding_function = false)
-      : ExprMutator(mod),
-        mod_(std::move(mod)),
-        create_single_binding_function_(create_single_binding_function) {
+                         const std::vector<Group*>& groups)
+      : ExprMutator(mod), mod_(std::move(mod)) {
     for (int nid = 0; nid < static_cast<int>(graph.post_dfs_order.size()); ++nid) {
       Group* group_root = groups[nid]->FindRoot();
       ICHECK(group_root != nullptr);
@@ -583,12 +576,8 @@ class OperatorFusor : public ExprMutator {
     }
   }
 
-  OperatorFusor(IRModule mod, const GroupMap& obj2group,
-                bool create_single_binding_function = false)
-      : ExprMutator(mod),
-        mod_(std::move(mod)),
-        obj2group_(obj2group),
-        create_single_binding_function_(create_single_binding_function) {}
+  OperatorFusor(IRModule mod, const GroupMap& obj2group)
+      : ExprMutator(mod), mod_(std::move(mod)), obj2group_(obj2group) {}
 
   /*!
    * \brief The main transformation on the IRModule
@@ -631,7 +620,7 @@ class OperatorFusor : public ExprMutator {
 
     // Step 3. Create the grouped function for each group.
     for (auto& [g, creator] : group2func_) {
-      creator.CreateFunction(g->composite_name);
+      creator.CreateFunction(g->attrs);
     }
 
     // Step 4. Start generating the new binding block.
@@ -656,7 +645,7 @@ class OperatorFusor : public ExprMutator {
       // Case 1. If the binding is the only binding in its group, recurse into it and emit the
       // transformed binding as usual.
       Group* group = GetGroupFromBinding(binding);
-      if (group->num_nodes == 1 && !create_single_binding_function_) {
+      if (group->num_nodes == 1 && group->attrs.empty()) {
         VisitBinding(binding);
         continue;
       }
@@ -725,7 +714,7 @@ class OperatorFusor : public ExprMutator {
     for (const Binding& binding : bindings) {
       // If the binding is the only binding in its group, there is no need to create a new function.
       Group* group = GetGroupFromBinding(binding);
-      if (group->num_nodes == 1 && !create_single_binding_function_) {
+      if (group->num_nodes == 1 && group->attrs.empty()) {
         continue;
       }
       // Add the binding to the grouped function it's in, and update the function information
@@ -864,8 +853,6 @@ class OperatorFusor : public ExprMutator {
   std::unordered_map<const VarNode*, int> tuple_get_indices_;
   /*! \brief A map from a group to its dependent groups, used to detect cyclic dependencies. */
   std::unordered_map<Group*, std::unordered_set<Group*>> group_deps_;
-  /*! \brief Whether or not a grouped function with a single binding should be created. */
-  bool create_single_binding_function_{false};
 };
 
 IRModule FuseOps(IRModule mod, int opt_level, size_t max_fuse_depth) {
@@ -884,9 +871,8 @@ IRModule FuseOps(IRModule mod, int opt_level, size_t max_fuse_depth) {
 }
 
 IRModule MakeGroupedFunctions(
-    IRModule mod, const std::unordered_map<const Object*, GraphPartitioner::Group*>& partition,
-    bool create_single_binding_function) {
-  return OperatorFusor(mod, partition, create_single_binding_function).Transform();
+    IRModule mod, const std::unordered_map<const Object*, GraphPartitioner::Group*>& partition) {
+  return OperatorFusor(mod, partition).Transform();
 }
 
 static Map<Expr, Var> GetBindingInverse(const Map<Var, Expr>& binding) {
@@ -916,8 +902,7 @@ class PatternBasedPartitioner : ExprVisitor {
     return part.group_map_;
   }
 
-  PatternBasedPartitioner(const std::string& pattern_name, DFPattern pattern,
-                          const Map<Var, Expr>& bindings)
+  PatternBasedPartitioner(String pattern_name, DFPattern pattern, const Map<Var, Expr>& bindings)
       : pat_name_(pattern_name),
         pat_(pattern),
         bindings_(bindings),
@@ -941,7 +926,7 @@ class PatternBasedPartitioner : ExprVisitor {
       // parent_group corresponds to the group of "conv1" above.
       auto parent_group = GetGroupForBoundVar(GetRef<Call>(call));
       ICHECK(parent_group);
-      parent_group->composite_name = pat_name_;
+      parent_group->attrs.Set(attr::kComposite, pat_name_);
 
       for (const auto& [pat, match] : matches_opt.value()) {
         ICHECK(group_map_.count(match.get()));
@@ -978,7 +963,7 @@ class PatternBasedPartitioner : ExprVisitor {
     return group_map_[bound_var.get()]->FindRoot();
   }
 
-  std::string pat_name_;
+  String pat_name_;
   DFPattern pat_;
   Map<Var, Expr> bindings_;
   Map<Expr, Var> value_to_bound_var_;
