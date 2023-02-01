@@ -56,8 +56,8 @@ class CodeGenRunner : ExprMutator {
 
     if (constant_names.size()) {
       Map<String, runtime::NDArray> constants;
-      for (const auto& [constant, name]: constant_names) {
-	constants.Set(name, constant->data);
+      for (const auto& [constant, name] : constant_names) {
+        constants.Set(name, constant->data);
       }
       out_mod = WithAttr(out_mod, tvm::attr::kConstNameToConstant, std::move(constants));
     }
@@ -110,7 +110,7 @@ class CodeGenRunner : ExprMutator {
         if (e->IsInstance<ConstantNode>()) {
           std::string name = ext_symbol + "_const_" + std::to_string(count++);
           auto constant = Downcast<Constant>(e);
-	  constant_names.Set(constant, name);
+          constant_names.Set(constant, name);
         }
       });
       return ExternFunc(GetExtSymbol(func));

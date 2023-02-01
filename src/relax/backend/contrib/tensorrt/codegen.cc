@@ -115,8 +115,8 @@ class CollectFromCompositeFunctionBody : public ExprVisitor {
  */
 class TensorRTJSONSerializer : public JSONSerializer {
  public:
-  explicit TensorRTJSONSerializer(const Map<Var, Expr>& bindings, Map<Constant, String> constant_names)
-    : JSONSerializer(constant_names), bindings_(bindings) {}
+  explicit TensorRTJSONSerializer(Map<Var, Expr> bindings, Map<Constant, String> constant_names)
+      : JSONSerializer(constant_names), bindings_(bindings) {}
 
   using JSONSerializer::VisitExpr_;
 

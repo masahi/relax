@@ -179,10 +179,6 @@ class JSONSerializer : public relax::MemoizedExprTranslator<NodeEntries> {
     return os.str();
   }
 
-  // Map<String, runtime::NDArray> const_name_to_constant() const {
-  //   return const_name_to_constant_;
-  // }
-
  protected:
   /*!
    * \brief Add a node to graph.
@@ -415,10 +411,9 @@ class JSONSerializer : public relax::MemoizedExprTranslator<NodeEntries> {
   std::vector<JSONGraphObjectPtr> nodes_;
   /*! \brief Output of the JSON graph. */
   NodeEntries heads_;
-
   /*! \brief The list of required constants. */
   Array<String> constants_used_;
-
+  /*! \brief TODO */
   Map<Constant, String> constant_names_;
 };
 

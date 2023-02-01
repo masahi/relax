@@ -24,7 +24,6 @@ import tvm
 from tvm import relax
 from tvm.ir.module import IRModule
 from tvm.runtime import Device, Module, PackedFunc, container
-from tvm.runtime.ndarray import NDArray
 from tvm.runtime.object import Object
 from tvm.tir.function import PrimFunc
 from . import _ffi_api
@@ -488,7 +487,6 @@ def _vmlink(
     tir_mod: Optional[tvm.IRModule] = None,
     ext_libs: List[tvm.runtime.Module] = None,
     params: Optional[Dict[str, list]] = None,
-    constants: Optional[Dict[str, NDArray]] = None,
 ):
     """
     Internal codegen function to make executable.
@@ -528,7 +526,7 @@ def _vmlink(
     lib = None
     if tir_mod is not None:
         lib = tvm.build(tir_mod, target=target)
-    return Executable(_ffi_api.VMLink(builder, target, lib, ext_libs, params, constants))  # type: ignore
+    return Executable(_ffi_api.VMLink(builder, target, lib, ext_libs, params))  # type: ignore
 
 
 def build(
@@ -597,12 +595,17 @@ def build(
     ext_libs = attrs.get("external_mods", [])
     constants = attrs.get("const_name_to_constant", {})
 
+    if params is not None:
+        params.update(dict(constants))
+    else:
+        params = constants
+
     # builder collects the executable
     builder = relax.ExecBuilder()
     leftover_mod = _vmcodegen(builder, new_mod, exec_mode=exec_mode)
     tir_mod = _filter_tir(leftover_mod)
 
-    return _vmlink(builder, target, tir_mod, ext_libs, params, constants)
+    return _vmlink(builder, target, tir_mod, ext_libs, params)
 
 
 def _filter_tir(mod: tvm.IRModule) -> tvm.IRModule:

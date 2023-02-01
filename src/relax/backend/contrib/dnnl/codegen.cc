@@ -39,7 +39,7 @@ using backend::contrib::NodeEntries;
 
 class DNNLJSONSerializer : public JSONSerializer {
  public:
-  DNNLJSONSerializer(const Map<Var, Expr>& bindings, Map<Constant, String> constant_names)
+  DNNLJSONSerializer(Map<Var, Expr> bindings, Map<Constant, String> constant_names)
       : JSONSerializer(constant_names), bindings_(bindings) {}
 
   using JSONSerializer::VisitExpr_;

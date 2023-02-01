@@ -466,7 +466,7 @@ TVM_REGISTER_GLOBAL("relax.VMCodeGen").set_body_typed(VMCodeGen);
  * \brief Link the libaries together.
  */
 Module VMLink(ExecBuilder builder, Target target, Optional<Module> lib, Array<Module> ext_libs,
-              Map<String, runtime::NDArray> params, Map<String, runtime::NDArray> constants) {
+              Map<String, runtime::NDArray> params) {
   // TODO(relax-team) Revisit the param and ext_lib options.
   ObjectPtr<Executable> executable = builder->Get();
   if (!lib.defined()) {
@@ -475,9 +475,6 @@ Module VMLink(ExecBuilder builder, Target target, Optional<Module> lib, Array<Mo
   std::unordered_map<std::string, runtime::NDArray> conv_params;
   for (const auto& [name, param] : params) {
     conv_params[name] = param;
-  }
-  for (const auto& [name, constant] : constants) {
-    conv_params[name] = constant;
   }
 
   Module combined_lib = codegen::CreateMetadataModule(

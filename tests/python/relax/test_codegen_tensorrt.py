@@ -88,8 +88,7 @@ def test_tensorrt_offload():
         ("tensorrt.add", add_pat),
     ]
 
-    params_np = {"weight1":weight1_np,
-              "weight2":weight2_np}
+    params_np = {"weight1": weight1_np, "weight2": weight2_np}
 
     seq = tvm.transform.Sequential(
         [
@@ -101,9 +100,6 @@ def test_tensorrt_offload():
     )
 
     mod = seq(Conv2dResidualBlock)
-
-    # print(mod.attrs["const_name_to_constant"])
-    # return
 
     target = "cuda"
     dev = tvm.device(target, 0)
