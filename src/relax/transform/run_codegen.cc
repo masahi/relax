@@ -104,17 +104,20 @@ class CodeGenRunner : ExprMutator {
     Function func = GetRef<Function>(func_node);
     auto opt_codegen = func->GetAttr<String>(attr::kCodegen);
     if (opt_codegen) {
+      auto ext_symbol = GetExtSymbol(func);
+      size_t count = 0;
+      PostOrderVisit(func->body, [=, &count](const Expr e) {
+        if (e->IsInstance<ConstantNode>()) {
+          std::string name = ext_symbol + "_const_" + std::to_string(count++);
+          auto constant = Downcast<Constant>(e);
+	  constant_names.Set(constant, name);
+        }
+      });
       return ExternFunc(GetExtSymbol(func));
     } else {
       return ExprMutator::VisitExpr_(func_node);
     }
   }
-
-  // Expr VisitExpr_(const ConstantNode* constant) override{
-  //   std::string symbol = "";
-  //   std::string name = symbol + "_const_" + std::to_string(constants.size());
-  //   return ExprMutator::VisitExpr_(constant);
-  // }
 
  private:
   Array<runtime::Module> InvokeCodegen(IRModule mod, Map<String, OptionMap> target_options) {

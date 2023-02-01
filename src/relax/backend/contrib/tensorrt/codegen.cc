@@ -115,8 +115,8 @@ class CollectFromCompositeFunctionBody : public ExprVisitor {
  */
 class TensorRTJSONSerializer : public JSONSerializer {
  public:
-  explicit TensorRTJSONSerializer(Map<Constant, String> constant_names)
-      : JSONSerializer(constant_names) {}
+  explicit TensorRTJSONSerializer(const Map<Var, Expr>& bindings, Map<Constant, String> constant_names)
+    : JSONSerializer(constant_names), bindings_(bindings) {}
 
   using JSONSerializer::VisitExpr_;
 
@@ -218,7 +218,7 @@ Array<runtime::Module> TensorRTCompiler(Array<Function> functions,
   Array<runtime::Module> compiled_functions;
   for (const auto& func : functions) {
     VLOG(1) << "TensorRT partition:" << std::endl << PrettyPrint(func);
-    TensorRTJSONSerializer serializer(constant_names);
+    TensorRTJSONSerializer serializer(AnalyzeVar2Value(func), constant_names);
     serializer.serialize(func);
     std::string graph_json = serializer.GetJSON();
     VLOG(1) << "TensorRT JSON:" << std::endl << graph_json;
