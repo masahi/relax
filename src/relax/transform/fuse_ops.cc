@@ -507,7 +507,7 @@ class FunctionCreator : public ExprMutator {
     // If the expression is not a variable or is a undefined variable, it should be populated as a
     // parameter of the relax function.
     const auto* var = expr.as<VarNode>();
-    if (var == nullptr || defined_vars_.count(var) == 0) {
+    if ((var == nullptr || defined_vars_.count(var) == 0) && !expr->IsInstance<ConstantNode>()) {
       String name{nullptr};
       if (var != nullptr) {
         name = var->name_hint();

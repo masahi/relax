@@ -15,6 +15,8 @@
 # specific language governing permissions and limitations
 # under the License.
 import pytest
+import numpy as np
+
 import tvm
 
 from tvm import relax
@@ -303,5 +305,27 @@ def test_cyclic_dependency():
     assert "A cyclic dependency detected" in str(err.value)
 
 
+@tvm.script.ir_module
+class Conv2dReLU:
+    @R.function
+    def main(
+        data: R.Tensor((1, 64, 56, 56), "float32"),
+        weight: R.Tensor((64, 64, 3, 3), "float32"),
+    ):
+        with R.dataflow():
+            conv = R.nn.relu(R.nn.conv2d(data, weight, padding=(1, 1)))
+            R.output(conv)
+
+        return conv
+
+
+def test_bind_params():
+    weight_np = np.random.randn(64, 64, 3, 3).astype("float32")
+    mod = relax.transform.BindParams("main", {"weight": weight_np})(Conv2dReLU)
+    mod = relax.transform.FuseOpsByPattern([("dnnl.conv2d_relu", conv2d_relu_pat)])(mod)
+    print(mod.script())
+
+
 if __name__ == "__main__":
-    pytest.main([__file__])
+    # pytest.main([__file__])
+    test_bind_params()

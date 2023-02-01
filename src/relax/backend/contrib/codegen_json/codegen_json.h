@@ -157,7 +157,8 @@ class JSONSerializer : public relax::MemoizedExprTranslator<NodeEntries> {
    * \param symbol The symbol that represents the graph being converted.
    * \param expr The Relax expression to be converted to the JSON form.
    */
-  explicit JSONSerializer(const std::string& symbol) : symbol_(symbol) {}
+  JSONSerializer(const std::string& symbol, Map<Constant, String> constant_names)
+      : symbol_(symbol), constant_names_(constant_names) {}
 
   void serialize(Function func) {
     // First we convert all the parameters into input nodes.
@@ -168,8 +169,8 @@ class JSONSerializer : public relax::MemoizedExprTranslator<NodeEntries> {
     heads_ = VisitExpr(func->body);
   }
 
-  /*!\brief Return the required params. */
-  Array<String> GetParams() const { return params_; }
+  /*!\brief Return the required constants. */
+  Array<String> GetConstantNames() const { return constants_used_; }
 
   /*!\brief Return the generated json. */
   std::string GetJSON() {
@@ -178,6 +179,10 @@ class JSONSerializer : public relax::MemoizedExprTranslator<NodeEntries> {
     Save(&writer);
     return os.str();
   }
+
+  // Map<String, runtime::NDArray> const_name_to_constant() const {
+  //   return const_name_to_constant_;
+  // }
 
  protected:
   /*!
@@ -320,9 +325,11 @@ class JSONSerializer : public relax::MemoizedExprTranslator<NodeEntries> {
   }
 
   NodeEntries VisitExpr_(const ConstantNode* cn) {
-    std::string name = symbol_ + "_const_" + std::to_string(params_.size());
-    params_.push_back(name);
-    auto node = std::make_shared<JSONGraphNode>(name, "const" /* op_type_ */);
+    auto name = constant_names_.find(GetRef<Constant>(cn));
+    ICHECK(name != constant_names_.end())
+        << "Cannot find the name of the constant: " << GetRef<Constant>(cn);
+    constants_used_.push_back(*name);
+    auto node = std::make_shared<JSONGraphNode>(*name, "const" /* op_type_ */);
     return AddNode(node, GetRef<Expr>(cn));
   }
 
@@ -411,8 +418,11 @@ class JSONSerializer : public relax::MemoizedExprTranslator<NodeEntries> {
   std::vector<JSONGraphObjectPtr> nodes_;
   /*! \brief Output of the JSON graph. */
   NodeEntries heads_;
+
   /*! \brief The list of required constants. */
-  Array<String> params_;
+  Array<String> constants_used_;
+
+  Map<Constant, String> constant_names_;
 };
 
 }  // namespace contrib

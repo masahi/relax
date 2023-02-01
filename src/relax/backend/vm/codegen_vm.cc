@@ -473,9 +473,18 @@ Module VMLink(ExecBuilder builder, Target target, Optional<Module> lib, Array<Mo
     lib = codegen::CSourceModuleCreate(";", "", Array<String>{});
   }
   std::unordered_map<std::string, runtime::NDArray> conv_params;
-  for (const auto& kv : params) {
-    conv_params[kv.first] = kv.second;
+  for (const auto& [name, param]  : params) {
+    conv_params[name] = param;
   }
+
+  for (const auto& ext_lib : ext_libs) {
+    //  ext_lib->GetAttr<Map<String, runtime::NDArray>>(tvm::attr::kConstNameToConstant).value_or({})
+    Map<String, runtime::NDArray> constants;
+    for (const auto& [name, c]  : params) {
+      conv_params[name] = c;
+    }
+  }
+
   Module combined_lib = codegen::CreateMetadataModule(
       conv_params, lib.value(), ext_libs, target,
 
