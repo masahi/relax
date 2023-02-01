@@ -261,6 +261,20 @@ class Branch:
         return out
 
 
+@tvm.script.ir_module
+class Conv2dReLU:
+    @R.function
+    def main(
+        data: R.Tensor((1, 64, 56, 56), "float32"),
+        weight: R.Tensor((64, 64, 3, 3), "float32"),
+    ):
+        with R.dataflow():
+            conv = R.nn.relu(R.nn.conv2d(data, weight, padding=(1, 1)))
+            R.output(conv)
+
+        return conv
+
+
 conv2d_pat = make_fused_bias_activation_pattern("relax.nn.conv2d", activation=None)
 conv2d_relu_pat = make_fused_bias_activation_pattern("relax.nn.conv2d", activation="relax.nn.relu")
 
@@ -305,27 +319,22 @@ def test_cyclic_dependency():
     assert "A cyclic dependency detected" in str(err.value)
 
 
-@tvm.script.ir_module
-class Conv2dReLU:
-    @R.function
-    def main(
-        data: R.Tensor((1, 64, 56, 56), "float32"),
-        weight: R.Tensor((64, 64, 3, 3), "float32"),
-    ):
-        with R.dataflow():
-            conv = R.nn.relu(R.nn.conv2d(data, weight, padding=(1, 1)))
-            R.output(conv)
-
-        return conv
-
-
 def test_bind_params():
     weight_np = np.random.randn(64, 64, 3, 3).astype("float32")
-    mod = relax.transform.BindParams("main", {"weight": weight_np})(Conv2dReLU)
-    mod = relax.transform.FuseOpsByPattern([("dnnl.conv2d_relu", conv2d_relu_pat)])(mod)
-    print(mod.script())
+    mod = tvm.transform.Sequential(
+        [
+            relax.transform.BindParams("main", {"weight": weight_np}),
+            relax.transform.FuseOpsByPattern([("dnnl.conv2d_relu", conv2d_relu_pat)]),
+        ]
+    )(Conv2dReLU)
+
+    assert "fused_relax_nn_conv2d_relax_nn_relu" in [var.name_hint for var in mod.functions.keys()]
+
+    for gvar, f in mod.functions.items():
+        if gvar.name_hint == "fused_relax_nn_conv2d_relax_nn_relu":
+            conv2d = f.body.blocks[0].bindings[0].value
+            assert isinstance(conv2d.args[1], relax.Constant)
 
 
 if __name__ == "__main__":
-    # pytest.main([__file__])
-    test_bind_params()
+    pytest.main([__file__])
