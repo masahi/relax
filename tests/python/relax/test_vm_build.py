@@ -909,5 +909,36 @@ def test_set_input_get_failure_rpc(exec_mode):
     run_on_rpc(TestVMSetInput, set_input_attempt_get, exec_mode)
 
 
+def test_rpc():
+    target = tvm.target.Target("llvm", host="llvm")
+    ex = relax.vm.build(TestVMSetInput, target)
+
+    temp = utils.tempdir()
+    path = temp.relpath("vm_library.so")
+    ex.mod.export_library(path)
+
+    server = rpc.Server("127.0.0.1")
+    remote = rpc.connect(server.host, server.port, session_timeout=10)
+
+    remote.upload(path)
+    rexec = remote.load_module("vm_library.so")
+
+    device = remote.cpu()
+
+    vm = relax.vm.VirtualMachine(exec=rexec, device=device)
+
+    # device = tvm.cpu(0)
+    # vm = relax.vm.VirtualMachine(exec=ex, device=device)
+
+    x_np = np.random.randn(32, 32).astype("float32")
+    y_np = np.random.randn(32, 32).astype("float32")
+
+    x = tvm.nd.array(x_np, device)
+    y = tvm.nd.array(y_np, device)
+
+    vm["main"](x, y)
+
+
 if __name__ == "__main__":
-    tvm.testing.main()
+    # tvm.testing.main()
+    test_rpc()

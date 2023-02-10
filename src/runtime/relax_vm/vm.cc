@@ -23,6 +23,7 @@
 
 #include <tvm/runtime/container/adt.h>
 #include <tvm/runtime/packed_func.h>
+#include <tvm/runtime/device_api.h>
 #include <tvm/runtime/relax_vm/vm.h>
 
 namespace tvm {
@@ -501,7 +502,24 @@ PackedFunc VirtualMachineImpl::GetFunction(const std::string& name,
     // default case, look up closure in VM.
     VMClosure clo = this->GetClosure(name);
     return PackedFunc([sptr_to_self, this, clo](TVMArgs args, TVMRetValue* rv) {
-      this->InvokeClosurePacked(clo, args, rv);
+      // if (tvm::runtime::IsRPCSessionDevice(devices[0])) {
+      if (true) {
+        std::vector<int> type_codes(args.num_args);
+        std::vector<TVMValue> values(args.num_args);
+        runtime::TVMArgsSetter setter(values.data(), type_codes.data());
+        for (int i = 0; i < args.num_args; ++i) {
+	  if (args[i].type_code() == kTVMDLTensorHandle) {
+	    DLTensor* tensor = args[i];
+	    setter(i, ConvertArgToDevice(args[i], tensor->device));
+	  } else {
+	    setter(i, args[i]);
+	  }
+        }
+        TVMArgs converted_args(values.data(), type_codes.data(), args.num_args);
+        this->InvokeClosurePacked(clo, converted_args, rv);
+      } else {
+        this->InvokeClosurePacked(clo, args, rv);
+      }
     });
   }
 }
